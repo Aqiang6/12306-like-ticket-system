@@ -1,0 +1,55 @@
+spring:
+  cloud:
+    # 聚合模式：单实例直连，不经过 Nacos 服务发现（dev 微服务模式仍走 lb:// + Nacos）
+    nacos:
+      discovery:
+        enabled: false
+    gateway:
+      default-filters:
+        - name: DedupeResponseHeader
+          args:
+            name: Content-Type
+            strategy: RETAIN_LAST
+      routes:
+        - id: index12306-user-aggregation-service
+          uri: http://127.0.0.1:9005
+          predicates:
+            - Path=/api/user-service/**
+          filters:
+            - name: TokenValidate
+              args:
+                blackPathPre:
+                  - /api/user-service/passenger
+                  - /api/user-service/query
+                  - /api/user-service/logout
+                  - /api/user-service/deletion
+
+        - id: index12306-ticket-aggregation-service
+          uri: http://127.0.0.1:9005
+          predicates:
+            - Path=/api/ticket-service/**
+          filters:
+            - name: TokenValidate
+              args:
+                blackPathPre:
+                  - /api/ticket-service/ticket/purchase
+                  - /api/ticket-service/ticket/pay/query
+                  - /api/ticket-service/ticket/cancel
+                  - /api/ticket-service/ticket/change
+
+        - id: index12306-pay-aggregation-service
+          uri: http://127.0.0.1:9005
+          predicates:
+            - Path=/api/pay-service/**
+
+        - id: index12306-order-aggregation-service
+          uri: http://127.0.0.1:9005
+          predicates:
+            - Path=/api/order-service/**
+          filters:
+            - name: TokenValidate
+              args:
+                blackPathPre:
+                  - /api/order-service/order/ticket/query
+                  - /api/order-service/order/ticket/page
+                  - /api/order-service/order/ticket/self/page
