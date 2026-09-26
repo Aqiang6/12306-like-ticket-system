@@ -80,7 +80,6 @@ import org.opengoofy.index12306.biz.ticketservice.service.TrainStationService;
 import org.opengoofy.index12306.biz.ticketservice.service.cache.SeatMarginCacheLoader;
 import org.opengoofy.index12306.biz.ticketservice.service.handler.ticket.dto.TrainPurchaseTicketRespDTO;
 import org.opengoofy.index12306.biz.ticketservice.service.handler.ticket.ratelimit.TicketPurchaseRateLimiter;
-import org.opengoofy.index12306.biz.ticketservice.service.handler.ticket.ratelimit.TicketStockReserver;
 import org.opengoofy.index12306.biz.ticketservice.service.cache.TicketStockDisplayRefresher;
 import org.opengoofy.index12306.biz.ticketservice.service.handler.ticket.select.TrainSeatTypeSelector;
 import org.opengoofy.index12306.biz.ticketservice.toolkit.ChangeTicketFeeCalculateUtil;
@@ -141,7 +140,6 @@ import static org.opengoofy.index12306.biz.ticketservice.common.constant.RedisKe
 import static org.opengoofy.index12306.biz.ticketservice.common.constant.RedisKeyConstant.TRAIN_INFO;
 import static org.opengoofy.index12306.biz.ticketservice.common.constant.RedisKeyConstant.TRAIN_STATION_PRICE;
 import static org.opengoofy.index12306.biz.ticketservice.common.constant.RedisKeyConstant.TRAIN_STATION_REMAINING_TICKET;
-import static org.opengoofy.index12306.biz.ticketservice.common.constant.RedisKeyConstant.TRAIN_STATION_REMAINING_DISPLAY;
 import static org.opengoofy.index12306.biz.ticketservice.common.constant.RedisKeyConstant.TRAIN_STATION_RELATION_DETAIL;
 import static org.opengoofy.index12306.biz.ticketservice.toolkit.DateUtil.convertDateToLocalTime;
 
@@ -172,8 +170,9 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
     private final RedissonClient redissonClient;
     private final ConfigurableEnvironment environment;
     private final TicketPurchaseRateLimiter ticketPurchaseRateLimiter;
-    private final TicketStockReserver ticketStockReserver;
     private final TicketStockDisplayRefresher ticketStockDisplayRefresher;
+    @org.springframework.beans.factory.annotation.Value("${ticket.purchase.max-wait-ms:300000}")
+    private long maxWaitMs;
     private TicketService ticketService;
 
     @Value("${ticket.availability.cache-update.type:}")
@@ -288,11 +287,8 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
                 String seatType = String.valueOf(item.getSeatType());
                 String keySuffix = StrUtil.join("_", each.getTrainId(), item.getDeparture(), item.getArrival());
                 ticketStockDisplayRefresher.touch(String.valueOf(each.getTrainId()));
-                // 首页/按钮读展示层（3s 周期刷新）；展示缓存未就绪时回退实时余票缓存
-                Object quantityObj = stringRedisTemplate.opsForHash().get(TRAIN_STATION_REMAINING_DISPLAY + keySuffix, seatType);
-                if (quantityObj == null) {
-                    quantityObj = stringRedisTemplate.opsForHash().get(TRAIN_STATION_REMAINING_TICKET + keySuffix, seatType);
-                }
+                // 首页/按钮读余票缓存（3s 周期由刷新器从位图/DB 重写，只读不扣减）
+                Object quantityObj = stringRedisTemplate.opsForHash().get(TRAIN_STATION_REMAINING_TICKET + keySuffix, seatType);
                 int quantity = Optional.ofNullable(quantityObj)
                         .map(Object::toString)
                         .map(Integer::parseInt)
@@ -398,15 +394,8 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
     public TicketPurchaseRespDTO purchaseTicketsV2(PurchaseTicketReqDTO requestParam) {
         // 责任链模式，验证 1：参数必填 2：参数正确性 3：乘客是否已买当前车次等...
         purchaseTicketAbstractChainContext.handler(TicketChainMarkEnum.TRAIN_PURCHASE_TICKET_FILTER.name(), requestParam);
-        // 分层准入第一层——库存原子预占（与首页查询同源的余票缓存）：
-        // 点击购买即原子扣减覆盖站段余票，任一站段不足直接返回已售完（自动触发阈值校准纠偏），
-        // 无票请求不消耗令牌桶额度也不进入锁队列；预占成功才进入令牌桶排队
-        Map<Integer, Integer> seatTypeNeed = requestParam.getPassengers().stream()
-                .collect(Collectors.groupingBy(PurchaseTicketPassengerDetailDTO::getSeatType, Collectors.summingInt(e -> 1)));
-        if (!ticketStockReserver.reserve(requestParam.getTrainId(), requestParam.getDeparture(), requestParam.getArrival(), seatTypeNeed)) {
-            throw new ClientException("车票已售完，您可提交候补订单或选择其他车次");
-        }
-        // 分层准入第二层——令牌桶：容量随余票动态伸缩、按固定速率控制进入临界区的节奏，削峰填谷；
+        // 分层准入：余票缓存只读（3s 周期从位图/DB 刷新，见 TicketStockDisplayRefresher），
+        // 售罄由前置责任链余票预判拦截；准入节奏由令牌桶控制（容量 = 余票 × 倍数 + 固定补充速率），
         // 超卖由锁内座位位图 + DB 校验兜底
         if (!ticketPurchaseRateLimiter.tryAcquire(requestParam.getTrainId(), requestParam.getDeparture(), requestParam.getArrival())) {
             throw new ServiceException("当前购票请求较多，请稍后重试");
@@ -430,16 +419,16 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
             RLock distributedLock = redissonClient.getFairLock(lockKey);
             distributedLockList.add(distributedLock);
         });
+        // 购票触达登记活跃车次，保证售罄广播与余票刷新持续覆盖本车次
+        ticketStockDisplayRefresher.touch(requestParam.getTrainId());
         TicketPurchasePrepareDTO prepare;
         try {
-            localLockList.forEach(ReentrantLock::lock);
-            distributedLockList.forEach(RLock::lock);
-            // 临界区仅保留：选座 + 锁座 + 车票落库（余票已在预占层扣减），订单创建移至锁外
+            // 分片 tryLock 获取两级公平锁，等待中周期检查售罄广播：售罄即退出队列，不空等锁位
+            acquirePurchaseLocksFairly(localLockList, distributedLockList, requestParam);
+            // 临界区仅保留：选座 + 锁座 + 车票落库，订单创建移至锁外
             prepare = ticketService.preparePurchaseTickets(requestParam);
         } catch (Throwable ex) {
-            // 预占库存的唯一回补点：临界区（选座/锁座/落票）任一失败，按预占口径整单回补一次
-            log.error("购票临界区执行失败，回补预占库存，请求参数：{}", JSON.toJSONString(requestParam), ex);
-            compensateRemainingTicket(requestParam.getTrainId(), requestParam.getDeparture(), requestParam.getArrival(), seatTypeNeed);
+            log.error("购票临界区执行失败，请求参数：{}", JSON.toJSONString(requestParam), ex);
             throw ex;
         } finally {
             localLockList.forEach(localLock -> {
@@ -458,20 +447,93 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
         return ticketService.createTicketOrder(prepare);
     }
 
-    @Override
-    @Transactional(rollbackFor = Throwable.class)
-    public TicketPurchasePrepareDTO preparePurchaseTickets(PurchaseTicketReqDTO requestParam) {
-        String trainId = requestParam.getTrainId();
+    /**
+     * 分片获取两级公平锁：每 200ms 一次 tryLock，分片间检查售罄广播（任一所需坐席售罄即整单退出），
+     * 避免售罄后排队者逐个空等到号；总等待超上限按限流提示退出。
+     * 部分获取失败时逆序释放已持有锁，保持与既有加锁顺序一致的防死锁纪律。
+     */
+    private void acquirePurchaseLocksFairly(List<ReentrantLock> localLockList, List<RLock> distributedLockList,
+                                            PurchaseTicketReqDTO requestParam) {
+        Set<Integer> seatTypes = requestParam.getPassengers().stream()
+                .map(PurchaseTicketPassengerDetailDTO::getSeatType).collect(Collectors.toSet());
+        long deadline = System.currentTimeMillis() + maxWaitMs;
+        for (ReentrantLock localLock : localLockList) {
+            while (true) {
+                checkSoldOutBroadcast(requestParam, seatTypes);
+                if (System.currentTimeMillis() > deadline) {
+                    throw new ServiceException("当前购票请求较多，请稍后重试");
+                }
+                try {
+                    if (localLock.tryLock(200, TimeUnit.MILLISECONDS)) {
+                        break;
+                    }
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    throw new ServiceException("当前购票请求较多，请稍后重试");
+                }
+            }
+        }
+        List<RLock> acquired = new ArrayList<>();
         try {
-            return doPreparePurchaseTickets(requestParam, trainId);
+            for (RLock distributedLock : distributedLockList) {
+                while (true) {
+                    checkSoldOutBroadcast(requestParam, seatTypes);
+                    if (System.currentTimeMillis() > deadline) {
+                        throw new ServiceException("当前购票请求较多，请稍后重试");
+                    }
+                    try {
+                        if (distributedLock.tryLock(200, TimeUnit.MILLISECONDS)) {
+                            acquired.add(distributedLock);
+                            break;
+                        }
+                    } catch (InterruptedException ex) {
+                        Thread.currentThread().interrupt();
+                        throw new ServiceException("当前购票请求较多，请稍后重试");
+                    }
+                }
+            }
         } catch (Throwable ex) {
-            // 预占库存的回补统一由 purchaseTicketsV2 的 catch 单点执行，此处仅记录日志，避免多重回补造成缓存膨胀
-            log.error("购票临界区执行失败，请求参数：{}", JSON.toJSONString(requestParam), ex);
+            for (int i = acquired.size() - 1; i >= 0; i--) {
+                try {
+                    acquired.get(i).unlock();
+                } catch (Throwable ignored) {
+                }
+            }
             throw ex;
         }
     }
 
+    private void checkSoldOutBroadcast(PurchaseTicketReqDTO requestParam, Set<Integer> seatTypes) {
+        if (ticketStockDisplayRefresher.isSoldOut(requestParam.getTrainId(), requestParam.getDeparture(),
+                requestParam.getArrival(), seatTypes)) {
+            throw new ClientException("车票已售完，您可提交候补订单或选择其他车次");
+        }
+    }
+
+    @Override
+    @Transactional(rollbackFor = Throwable.class)
+    public TicketPurchasePrepareDTO preparePurchaseTickets(PurchaseTicketReqDTO requestParam) {
+        String trainId = requestParam.getTrainId();
+        return doPreparePurchaseTickets(requestParam, trainId);
+    }
+
     private TicketPurchasePrepareDTO doPreparePurchaseTickets(PurchaseTicketReqDTO requestParam, String trainId) {
+        // 售罄快速失败：排队至拿锁期间余票可能已被售罄（余票缓存 3s 周期刷新），
+        // 拿锁后先校验，避免注定失败的无效选座
+        StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
+        String stockKey = TRAIN_STATION_REMAINING_TICKET + StrUtil.join("_", trainId, requestParam.getDeparture(), requestParam.getArrival());
+        Map<Integer, Long> seatTypeNeed = requestParam.getPassengers().stream()
+                .collect(Collectors.groupingBy(PurchaseTicketPassengerDetailDTO::getSeatType, Collectors.counting()));
+        List<Object> stockValues = stringRedisTemplate.opsForHash().multiGet(stockKey,
+                seatTypeNeed.keySet().stream().map(String::valueOf).collect(Collectors.toList()));
+        for (int i = 0; i < seatTypeNeed.size(); i++) {
+            Object value = stockValues.get(i);
+            long stock = value == null ? 0L : Long.parseLong(value.toString());
+            long need = (Long) seatTypeNeed.values().toArray()[i];
+            if (stock < need) {
+                throw new ClientException("车票已售完，您可提交候补订单或选择其他车次");
+            }
+        }
         // 节假日高并发购票Redis能扛得住么？详情查看：https://nageoffer.com/12306/question
         TrainDO trainDO = distributedCache.safeGet(
                 TRAIN_INFO + trainId,
@@ -611,18 +673,6 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
         return new TicketPurchaseRespDTO(ticketOrderResult.getData(), ticketOrderDetailResults);
     }
 
-    private void compensateRemainingTicket(String trainId, String departure, String arrival, Map<Integer, Integer> seatTypeNeed) {
-        try {
-            StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
-            List<RouteDTO> routeDTOList = trainStationService.listTakeoutTrainStationRoute(trainId, departure, arrival);
-            routeDTOList.forEach(item -> seatTypeNeed.forEach((seatType, count) -> stringRedisTemplate.opsForHash().increment(
-                    TRAIN_STATION_REMAINING_TICKET + StrUtil.join("_", trainId, item.getStartStation(), item.getEndStation()),
-                    String.valueOf(seatType), count)));
-        } catch (Throwable ex) {
-            log.error("[购票补偿] 回补余票缓存失败，车次：{}", trainId, ex);
-        }
-    }
-
     private void compensateLockFailure(TicketPurchasePrepareDTO prepare) {
         try {
             removeByIds(prepare.getTicketIds());
@@ -634,17 +684,7 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
         } catch (Throwable ex) {
             log.error("[购票补偿] 释放座位失败，车次：{}", prepare.getTrainId(), ex);
         }
-        try {
-            StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
-            List<RouteDTO> routeDTOList = trainStationService.listTakeoutTrainStationRoute(prepare.getTrainId(), prepare.getDeparture(), prepare.getArrival());
-            prepare.getSeatResults().stream()
-                    .collect(Collectors.groupingBy(TrainPurchaseTicketRespDTO::getSeatType, Collectors.counting()))
-                    .forEach((seatType, count) -> routeDTOList.forEach(item -> stringRedisTemplate.opsForHash().increment(
-                            TRAIN_STATION_REMAINING_TICKET + StrUtil.join("_", prepare.getTrainId(), item.getStartStation(), item.getEndStation()),
-                            String.valueOf(seatType), count)));
-        } catch (Throwable ex) {
-            log.error("[购票补偿] 回补余票缓存失败，车次：{}", prepare.getTrainId(), ex);
-        }
+        // 余票缓存由展示层刷新器周期从 DB 重算，此处无需回补
     }
 
     @Override
@@ -890,11 +930,7 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
             if (!ticketPurchaseRateLimiter.tryAcquire(newPurchaseReq.getTrainId(), newPurchaseReq.getDeparture(), newPurchaseReq.getArrival())) {
                 throw new ServiceException("当前改签请求较多，请稍后重试");
             }
-            Map<Integer, Integer> changeSeatTypeNeed = newPurchaseReq.getPassengers().stream()
-                    .collect(Collectors.groupingBy(PurchaseTicketPassengerDetailDTO::getSeatType, Collectors.summingInt(e -> 1)));
-            if (!ticketStockReserver.reserve(newPurchaseReq.getTrainId(), newPurchaseReq.getDeparture(), newPurchaseReq.getArrival(), changeSeatTypeNeed)) {
-                throw new ServiceException("车票已售完，您可提交候补订单或选择其他车次");
-            }
+
             int refundAmount = oldAmountTotal - changeFeeTotal;
             String newOrderSn;
             List<TrainPurchaseTicketRespDTO> newSeatResults = null;
@@ -917,14 +953,7 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
                 refundChangeTickets(requestParam.getOrderSn(), selectedPassengerDetails, itemFeeMap, refundAmount);
                 markOldTicketsChanged(orderDetail, selectedPassengerDetails);
             } catch (Throwable ex) {
-                if (CollUtil.isNotEmpty(newSeatResults)) {
-                    compensateNewSeatResources(newPurchaseReq, newSeatResults);
-                } else {
-                    // 预占已扣减但尚未产生座位分配，按预占口径回补，避免改签失败造成缓存泄漏
-                    compensateRemainingTicket(newPurchaseReq.getTrainId(), newPurchaseReq.getDeparture(), newPurchaseReq.getArrival(),
-                            newPurchaseReq.getPassengers().stream()
-                                    .collect(Collectors.groupingBy(PurchaseTicketPassengerDetailDTO::getSeatType, Collectors.summingInt(e -> 1))));
-                }
+                compensateNewSeatResources(newPurchaseReq, newSeatResults);
                 throw ex;
             }
             // 释放原票座位、清理座位占用位图、回滚余票缓存与令牌桶，尽力而为不阻塞改签结果

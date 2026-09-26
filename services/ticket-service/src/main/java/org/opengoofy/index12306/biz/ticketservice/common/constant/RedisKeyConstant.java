@@ -69,11 +69,6 @@ public final class RedisKeyConstant {
     public static final String TRAIN_STATION_REMAINING_TICKET = "index12306-ticket-service:train_station_remaining_ticket:";
 
     /**
-     * 余票展示层缓存 Key（按钮亮不亮展示用，周期从位图/DB 刷新，与准入计数分离）
-     */
-    public static final String TRAIN_STATION_REMAINING_DISPLAY = "index12306-ticket-service:train_station_remaining_display:";
-
-    /**
      * 列车车厢查询，Key Prefix + 列车ID
      */
     public static final String TRAIN_CARRIAGE = "index12306-ticket-service:train_carriage:";

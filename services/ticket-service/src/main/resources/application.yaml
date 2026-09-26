@@ -83,12 +83,12 @@ framework:
 
 ticket:
   purchase:
-    # 购票限流令牌桶：桶容量 = 当前区间余票缓存总量 × capacity-multiplier（动态跟随票量，临近售罄准入自动收紧），
+    # 购票限流令牌桶：准入闸门（余票缓存只读展示，每 3s 由刷新器从位图/DB 重写），
     # refill-rate 按下游选座临界区（两级公平锁 + 位图选座）实测排水能力配置并留有余量
     rate-limiter:
       enabled: true
       capacity-multiplier: 1.5
-      refill-rate: 25
+      refill-rate: 10
 
 feign:
   client:

@@ -51,10 +51,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
- * 余票展示层刷新器：余票缓存降级为"按钮亮不亮"的展示层，与准入计数分离。
+ * 余票缓存刷新器：余票缓存为只读展示层（"按钮亮不亮"），不做准入计数（准入由令牌桶负责）。
  * 周期（默认 3 秒）从座位占用位图 pipeline 拉取位图、本地聚合出各站段组合 × 坐席的可售数，
- * 写入展示缓存 Key（TRAIN_STATION_REMAINING_DISPLAY）；首页/按钮只读展示层，
- * 与预占扣减的实时余票缓存（TRAIN_STATION_REMAINING_TICKET）互不干扰。
+ * 周期性重写余票缓存（TRAIN_STATION_REMAINING_TICKET）；令牌桶容量与首页余票均读该缓存。
  * 不支持位图的坐席（卧铺等）回退数据库统计刷新，并降低刷新频率。
  */
 @Slf4j
@@ -62,7 +61,7 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class TicketStockDisplayRefresher {
 
-    private static final String DISPLAY_KEY = RedisKeyConstant.TRAIN_STATION_REMAINING_DISPLAY;
+    private static final String DISPLAY_KEY = RedisKeyConstant.TRAIN_STATION_REMAINING_TICKET;
     private static final String BITMAP_KEY = RedisKeyConstant.TRAIN_CARRIAGE_SEAT_STATUS;
 
     private final StringRedisTemplate stringRedisTemplate;
@@ -105,6 +104,12 @@ public class TicketStockDisplayRefresher {
 
     private final Map<String, Long> dbFallbackLastRun = new HashMap<>();
 
+    /**
+     * 售罄广播标志：Key = 车次_出发_到达_席别，由刷新周期写入（余票为 0 → true，恢复 > 0 → 清除）。
+     * 购票等待线程以 200ms 分片 tryLock 轮询该标志，售罄即退出队列，不再空等锁位。
+     */
+    private final Map<String, Boolean> soldOutFlags = new java.util.concurrent.ConcurrentHashMap<>();
+
     private ScheduledExecutorService scheduler;
 
     @PostConstruct
@@ -122,6 +127,36 @@ public class TicketStockDisplayRefresher {
     public void stop() {
         if (scheduler != null) {
             scheduler.shutdownNow();
+        }
+    }
+
+    /**
+     * 售罄广播查询：任一所需坐席在对应区间售罄即返回 true（标志由刷新周期维护，最长 3s 延迟）
+     */
+    public boolean isSoldOut(String trainId, String departure, String arrival, java.util.Set<Integer> seatTypes) {
+        for (Integer seatType : seatTypes) {
+            if (Boolean.TRUE.equals(soldOutFlags.get(trainId + "_" + departure + "_" + arrival + "_" + seatType))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void updateSoldOutFlags(String trainId, List<String> stations, Map<Integer, int[]> countsBySeatType) {
+        int comboIdx = 0;
+        for (int dep = 0; dep < stations.size() - 1; dep++) {
+            for (int arr = dep + 1; arr < stations.size(); arr++) {
+                String comboKey = trainId + "_" + stations.get(dep) + "_" + stations.get(arr) + "_";
+                for (Map.Entry<Integer, int[]> entry : countsBySeatType.entrySet()) {
+                    String flagKey = comboKey + entry.getKey();
+                    if (entry.getValue()[comboIdx] <= 0) {
+                        soldOutFlags.put(flagKey, Boolean.TRUE);
+                    } else {
+                        soldOutFlags.remove(flagKey);
+                    }
+                }
+                comboIdx++;
+            }
         }
     }
 
@@ -237,6 +272,7 @@ public class TicketStockDisplayRefresher {
     }
 
     private void writeDisplayKeys(String trainId, List<String> stations, Map<Integer, int[]> countsBySeatType, boolean suppressLog) {
+        updateSoldOutFlags(trainId, stations, countsBySeatType);
         stringRedisTemplate.executePipelined((org.springframework.data.redis.core.RedisCallback<Object>) connection -> {
             int comboIdx = 0;
             for (int dep = 0; dep < stations.size() - 1; dep++) {
