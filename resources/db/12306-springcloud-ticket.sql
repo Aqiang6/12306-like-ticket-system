@@ -151,3 +151,22 @@ CREATE TABLE `t_train_station_relation`
     PRIMARY KEY (`id`),
     KEY              `idx_train_id` (`train_id`) USING BTREE
 ) ENGINE=InnoDB AUTO_INCREMENT=1677689610742865921 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='列车站点关系表';
+
+CREATE TABLE `t_order_create_task`
+(
+    `id`              bigint(20) unsigned NOT NULL AUTO_INCREMENT COMMENT 'ID',
+    `purchase_token`  varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '购票幂等令牌（订单服务按令牌幂等创建订单）',
+    `username`        varchar(256) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '用户名',
+    `user_id`         varchar(32) COLLATE utf8mb4_unicode_ci  DEFAULT NULL COMMENT '用户ID',
+    `train_id`        bigint(20) DEFAULT NULL COMMENT '车次ID',
+    `task_status`     tinyint(1) NOT NULL DEFAULT '0' COMMENT '任务状态：0-待确认 1-已完成 2-已作废',
+    `retry_count`     int(11) NOT NULL DEFAULT '0' COMMENT '补偿投递次数',
+    `next_retry_time` datetime DEFAULT NULL COMMENT '下次补偿投递时间',
+    `task_content`    text COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '任务内容（购票临界区产物上下文 JSON）',
+    `create_time`     datetime DEFAULT NULL COMMENT '创建时间',
+    `update_time`     datetime DEFAULT NULL COMMENT '修改时间',
+    `del_flag`        tinyint(1) DEFAULT NULL COMMENT '删除标识',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY        `uk_purchase_token` (`purchase_token`) USING BTREE,
+    KEY               `idx_task_status_retry` (`task_status`, `next_retry_time`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='订单创建补偿任务表（事务性发件箱：与车票账本同事务写入，实例宕机后补偿重建订单）';

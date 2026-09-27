@@ -57,6 +57,7 @@ import org.opengoofy.index12306.biz.orderservice.remote.dto.UserQueryActualRespD
 import org.opengoofy.index12306.biz.orderservice.service.OrderItemService;
 import org.opengoofy.index12306.biz.orderservice.service.OrderPassengerRelationService;
 import org.opengoofy.index12306.biz.orderservice.service.OrderService;
+import cn.hutool.core.util.StrUtil;
 import org.opengoofy.index12306.biz.orderservice.service.orderid.OrderIdGeneratorManager;
 import org.opengoofy.index12306.framework.starter.common.toolkit.BeanUtil;
 import org.opengoofy.index12306.framework.starter.common.toolkit.EnvironmentUtil;
@@ -68,8 +69,11 @@ import org.opengoofy.index12306.framework.starter.database.toolkit.PageUtil;
 import org.opengoofy.index12306.frameworks.starter.user.core.UserContext;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -77,6 +81,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 订单服务接口层实现
@@ -95,6 +100,22 @@ public class OrderServiceImpl implements OrderService {
     private final RedissonClient redissonClient;
     private final DelayCloseOrderSendProduce delayCloseOrderSendProduce;
     private final UserRemoteService userRemoteService;
+    private final StringRedisTemplate stringRedisTemplate;
+
+    /**
+     * 购票幂等令牌 Redis Key 前缀（Value = 令牌对应订单号）
+     */
+    private static final String ORDER_PURCHASE_TOKEN_PREFIX = "index12306-order:purchase_token:";
+
+    /**
+     * 购票幂等令牌并发互斥锁前缀
+     */
+    private static final String ORDER_PURCHASE_TOKEN_LOCK_PREFIX = "index12306-order:purchase_token_lock:";
+
+    /**
+     * 购票幂等令牌有效期：覆盖延迟关单等订单生命周期即可
+     */
+    private static final long PURCHASE_TOKEN_EXPIRE_DAYS = 7L;
 
     @Override
     public TicketOrderDetailRespDTO queryTicketOrderByOrderSn(String orderSn) {
@@ -165,8 +186,26 @@ public class OrderServiceImpl implements OrderService {
     @Transactional(rollbackFor = Exception.class)
     @Override
     public String createTicketOrder(TicketOrderCreateReqDTO requestParam) {
+        String purchaseToken = requestParam.getPurchaseToken();
+        RLock tokenLock = null;
+        if (StrUtil.isNotBlank(purchaseToken)) {
+            // 购票令牌幂等：同一令牌仅允许创建一单，覆盖"同步建单与宕机补偿并发、补偿消息重复投递、
+            // 上次尝试回滚后重试"等场景；互斥锁跨事务持锁（提交后释放），防止并发互查窗口内重复建单
+            tokenLock = redissonClient.getLock(ORDER_PURCHASE_TOKEN_LOCK_PREFIX + purchaseToken);
+            tokenLock.lock(10, TimeUnit.SECONDS);
+            registerUnlockAfterTxCompletion(tokenLock);
+            String existedOrderSn = resolveClaimedOrderSn(purchaseToken);
+            if (StrUtil.isNotBlank(existedOrderSn)) {
+                log.warn("[订单幂等] 购票令牌已创建过订单，直接返回既有订单号，令牌：{}，订单号：{}", purchaseToken, existedOrderSn);
+                return existedOrderSn;
+            }
+        }
         // 通过基因法将用户 ID 融入到订单号
         String orderSn = OrderIdGeneratorManager.generateId(requestParam.getUserId());
+        if (StrUtil.isNotBlank(purchaseToken)) {
+            stringRedisTemplate.opsForValue().set(ORDER_PURCHASE_TOKEN_PREFIX + purchaseToken, orderSn,
+                    PURCHASE_TOKEN_EXPIRE_DAYS, TimeUnit.DAYS);
+        }
         OrderDO orderDO = OrderDO.builder().orderSn(orderSn)
                 .orderTime(requestParam.getOrderTime())
                 .departure(requestParam.getDeparture())
@@ -234,6 +273,46 @@ public class OrderServiceImpl implements OrderService {
             }
         }
         return orderSn;
+    }
+
+    /**
+     * 解析令牌的既有认领：已认领且订单真实落库则返回订单号（幂等命中）；
+     * 已认领但订单不存在，说明上次尝试已回滚或宕机未落库，清理陈旧认领后允许重新创建
+     */
+    private String resolveClaimedOrderSn(String purchaseToken) {
+        String claimedOrderSn = stringRedisTemplate.opsForValue().get(ORDER_PURCHASE_TOKEN_PREFIX + purchaseToken);
+        if (StrUtil.isBlank(claimedOrderSn)) {
+            return null;
+        }
+        if (orderExists(claimedOrderSn)) {
+            return claimedOrderSn;
+        }
+        stringRedisTemplate.delete(ORDER_PURCHASE_TOKEN_PREFIX + purchaseToken);
+        return null;
+    }
+
+    private boolean orderExists(String orderSn) {
+        Long count = orderMapper.selectCount(Wrappers.lambdaQuery(OrderDO.class).eq(OrderDO::getOrderSn, orderSn));
+        return count != null && count > 0;
+    }
+
+    /**
+     * 事务提交/回滚后释放购票令牌互斥锁：锁必须覆盖到订单落库提交，
+     * 若在事务内直接 unlock，并发请求会在"已认领但未提交"的窗口内误判订单不存在而重复建单
+     */
+    private void registerUnlockAfterTxCompletion(RLock lock) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCompletion(int status) {
+                    try {
+                        lock.unlock();
+                    } catch (Throwable ignored) {
+                        // 租期（10s）兜底自动释放，此处忽略解锁异常
+                    }
+                }
+            });
+        }
     }
 
     @Transactional(rollbackFor = Exception.class)

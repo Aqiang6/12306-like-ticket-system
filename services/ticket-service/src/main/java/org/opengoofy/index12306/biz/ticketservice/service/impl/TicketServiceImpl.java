@@ -20,6 +20,7 @@ package org.opengoofy.index12306.biz.ticketservice.service.impl;
 import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.collection.CollectionUtil;
 import cn.hutool.core.map.MapUtil;
+import cn.hutool.core.util.IdUtil;
 import cn.hutool.core.util.StrUtil;
 import com.alibaba.fastjson2.JSON;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
@@ -74,6 +75,7 @@ import org.opengoofy.index12306.biz.ticketservice.remote.dto.RefundRespDTO;
 import org.opengoofy.index12306.biz.ticketservice.remote.dto.TicketOrderCreateRemoteReqDTO;
 import org.opengoofy.index12306.biz.ticketservice.remote.dto.TicketOrderItemCreateRemoteReqDTO;
 import org.opengoofy.index12306.biz.ticketservice.remote.dto.TicketOrderPassengerDetailRespDTO;
+import org.opengoofy.index12306.biz.ticketservice.service.OrderCreateTaskService;
 import org.opengoofy.index12306.biz.ticketservice.service.SeatService;
 import org.opengoofy.index12306.biz.ticketservice.service.TicketService;
 import org.opengoofy.index12306.biz.ticketservice.service.TrainStationService;
@@ -171,6 +173,7 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
     private final ConfigurableEnvironment environment;
     private final TicketPurchaseRateLimiter ticketPurchaseRateLimiter;
     private final TicketStockDisplayRefresher ticketStockDisplayRefresher;
+    private final OrderCreateTaskService orderCreateTaskService;
     @org.springframework.beans.factory.annotation.Value("${ticket.purchase.max-wait-ms:300000}")
     private long maxWaitMs;
     private TicketService ticketService;
@@ -566,126 +569,140 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
             seatService.unlock(trainId, requestParam.getDeparture(), requestParam.getArrival(), trainPurchaseTicketResults);
             throw ex;
         }
-        return TicketPurchasePrepareDTO.builder()
+        TicketPurchasePrepareDTO prepare = TicketPurchasePrepareDTO.builder()
                 .trainId(trainId)
                 .departure(requestParam.getDeparture())
                 .arrival(requestParam.getArrival())
                 .trainNumber(trainDO.getTrainNumber())
                 .ticketIds(ticketDOList.stream().map(TicketDO::getId).toList())
                 .seatResults(trainPurchaseTicketResults)
+                // 发件箱（t_order_create_task）与账本同事务写入：实例在"账本已落库、订单未创建"间宕机时由补偿链路重建订单
+                .purchaseToken(IdUtil.fastSimpleUUID())
                 .build();
+        orderCreateTaskService.record(prepare, UserContext.getUsername(), UserContext.getUserId());
+        return prepare;
     }
 
     @Override
     public TicketPurchaseRespDTO createTicketOrder(TicketPurchasePrepareDTO prepare) {
+        try {
+            return doCreateTicketOrder(prepare);
+        } catch (Throwable ex) {
+            log.error("订单创建失败，补偿释放已锁座位并回补余票缓存，请求参数：{}", JSON.toJSONString(prepare), ex);
+            rollbackPurchase(prepare);
+            throw ex;
+        }
+    }
+
+    @Override
+    public TicketPurchaseRespDTO doCreateTicketOrder(TicketPurchasePrepareDTO prepare) {
         List<TrainPurchaseTicketRespDTO> trainPurchaseTicketResults = prepare.getSeatResults();
         List<TicketOrderDetailRespDTO> ticketOrderDetailResults = new ArrayList<>();
         Result<String> ticketOrderResult;
+        // 乘车人信息补全（远程调用已移出购票临界区）
+        List<String> passengerIds = trainPurchaseTicketResults.stream()
+                .map(TrainPurchaseTicketRespDTO::getPassengerId)
+                .collect(Collectors.toList());
+        Result<List<PassengerRespDTO>> passengerRemoteResult;
+        List<PassengerRespDTO> passengerRemoteResultList;
         try {
-            // 乘车人信息补全（远程调用已移出购票临界区）
-            List<String> passengerIds = trainPurchaseTicketResults.stream()
-                    .map(TrainPurchaseTicketRespDTO::getPassengerId)
-                    .collect(Collectors.toList());
-            Result<List<PassengerRespDTO>> passengerRemoteResult;
-            List<PassengerRespDTO> passengerRemoteResultList;
-            try {
-                passengerRemoteResult = userRemoteService.listPassengerQueryByIds(UserContext.getUsername(), passengerIds);
-                if (!passengerRemoteResult.isSuccess() || CollUtil.isEmpty(passengerRemoteResultList = passengerRemoteResult.getData())) {
-                    throw new RemoteException("用户服务远程调用查询乘车人相关信息错误");
-                }
-            } catch (Throwable ex) {
-                if (!(ex instanceof RemoteException)) {
-                    log.error("用户服务远程调用查询乘车人相关信息错误，当前用户：{}，请求参数：{}", UserContext.getUsername(), passengerIds, ex);
-                }
-                throw ex;
-            }
-            trainPurchaseTicketResults.forEach(each -> passengerRemoteResultList.stream()
-                    .filter(item -> Objects.equals(item.getId(), each.getPassengerId()))
-                    .findFirst()
-                    .ifPresent(passenger -> {
-                        each.setIdCard(passenger.getIdCard());
-                        each.setPhone(passenger.getPhone());
-                        each.setUserType(passenger.getDiscountType());
-                        each.setIdType(passenger.getIdType());
-                        each.setRealName(passenger.getRealName());
-                    }));
-            // 票价补全：复用首页票价缓存（同键同装载），进程内按坐席过滤，购票路径不落库
-            List<Integer> seatTypes = trainPurchaseTicketResults.stream().map(TrainPurchaseTicketRespDTO::getSeatType).distinct().toList();
-            String trainStationPriceStr = distributedCache.safeGet(
-                    String.format(TRAIN_STATION_PRICE, prepare.getTrainId(), prepare.getDeparture(), prepare.getArrival()),
-                    String.class,
-                    () -> JSON.toJSONString(trainStationPriceMapper.selectList(Wrappers.lambdaQuery(TrainStationPriceDO.class)
-                            .eq(TrainStationPriceDO::getTrainId, prepare.getTrainId())
-                            .eq(TrainStationPriceDO::getDeparture, prepare.getDeparture())
-                            .eq(TrainStationPriceDO::getArrival, prepare.getArrival()))),
-                    ADVANCE_TICKET_DAY, TimeUnit.DAYS);
-            Map<Integer, Integer> priceMap = JSON.parseArray(trainStationPriceStr, TrainStationPriceDO.class).stream()
-                    .filter(each -> seatTypes.contains(each.getSeatType()))
-                    .collect(Collectors.toMap(TrainStationPriceDO::getSeatType, TrainStationPriceDO::getPrice, (a, b) -> a));
-            trainPurchaseTicketResults.forEach(each -> each.setAmount(priceMap.get(each.getSeatType())));
-            List<TicketOrderItemCreateRemoteReqDTO> orderItemCreateRemoteReqDTOList = new ArrayList<>();
-            trainPurchaseTicketResults.forEach(each -> {
-                TicketOrderItemCreateRemoteReqDTO orderItemCreateRemoteReqDTO = TicketOrderItemCreateRemoteReqDTO.builder()
-                        .amount(each.getAmount())
-                        .carriageNumber(each.getCarriageNumber())
-                        .seatNumber(each.getSeatNumber())
-                        .idCard(each.getIdCard())
-                        .idType(each.getIdType())
-                        .phone(each.getPhone())
-                        .seatType(each.getSeatType())
-                        .ticketType(each.getUserType())
-                        .realName(each.getRealName())
-                        .build();
-                TicketOrderDetailRespDTO ticketOrderDetailRespDTO = TicketOrderDetailRespDTO.builder()
-                        .amount(each.getAmount())
-                        .carriageNumber(each.getCarriageNumber())
-                        .seatNumber(each.getSeatNumber())
-                        .idCard(each.getIdCard())
-                        .idType(each.getIdType())
-                        .seatType(each.getSeatType())
-                        .ticketType(each.getUserType())
-                        .realName(each.getRealName())
-                        .build();
-                orderItemCreateRemoteReqDTOList.add(orderItemCreateRemoteReqDTO);
-                ticketOrderDetailResults.add(ticketOrderDetailRespDTO);
-            });
-            // 车站关系（发到时刻）：静态数据走缓存，购票路径不落库
-            TrainStationRelationDO trainStationRelationDO = distributedCache.safeGet(
-                    TRAIN_STATION_RELATION_DETAIL + StrUtil.join("_", prepare.getTrainId(), prepare.getDeparture(), prepare.getArrival()),
-                    TrainStationRelationDO.class,
-                    () -> trainStationRelationMapper.selectOne(Wrappers.lambdaQuery(TrainStationRelationDO.class)
-                            .eq(TrainStationRelationDO::getTrainId, prepare.getTrainId())
-                            .eq(TrainStationRelationDO::getDeparture, prepare.getDeparture())
-                            .eq(TrainStationRelationDO::getArrival, prepare.getArrival())),
-                    ADVANCE_TICKET_DAY, TimeUnit.DAYS);
-            TicketOrderCreateRemoteReqDTO orderCreateRemoteReqDTO = TicketOrderCreateRemoteReqDTO.builder()
-                    .departure(prepare.getDeparture())
-                    .arrival(prepare.getArrival())
-                    .orderTime(new Date())
-                    .source(SourceEnum.INTERNET.getCode())
-                    .trainNumber(prepare.getTrainNumber())
-                    .departureTime(trainStationRelationDO.getDepartureTime())
-                    .arrivalTime(trainStationRelationDO.getArrivalTime())
-                    .ridingDate(trainStationRelationDO.getDepartureTime())
-                    .userId(UserContext.getUserId())
-                    .username(UserContext.getUsername())
-                    .trainId(Long.parseLong(prepare.getTrainId()))
-                    .ticketOrderItems(orderItemCreateRemoteReqDTOList)
-                    .build();
-            ticketOrderResult = ticketOrderRemoteService.createTicketOrder(orderCreateRemoteReqDTO);
-            if (!ticketOrderResult.isSuccess() || StrUtil.isBlank(ticketOrderResult.getData())) {
-                log.error("订单服务调用失败，返回结果：{}", ticketOrderResult.getMessage());
-                throw new ServiceException("订单服务调用失败");
+            passengerRemoteResult = userRemoteService.listPassengerQueryByIds(UserContext.getUsername(), passengerIds);
+            if (!passengerRemoteResult.isSuccess() || CollUtil.isEmpty(passengerRemoteResultList = passengerRemoteResult.getData())) {
+                throw new RemoteException("用户服务远程调用查询乘车人相关信息错误");
             }
         } catch (Throwable ex) {
-            log.error("订单创建失败，补偿释放已锁座位并回补余票缓存，请求参数：{}", JSON.toJSONString(prepare), ex);
-            compensateLockFailure(prepare);
+            if (!(ex instanceof RemoteException)) {
+                log.error("用户服务远程调用查询乘车人相关信息错误，当前用户：{}，请求参数：{}", UserContext.getUsername(), passengerIds, ex);
+            }
             throw ex;
         }
+        trainPurchaseTicketResults.forEach(each -> passengerRemoteResultList.stream()
+                .filter(item -> Objects.equals(item.getId(), each.getPassengerId()))
+                .findFirst()
+                .ifPresent(passenger -> {
+                    each.setIdCard(passenger.getIdCard());
+                    each.setPhone(passenger.getPhone());
+                    each.setUserType(passenger.getDiscountType());
+                    each.setIdType(passenger.getIdType());
+                    each.setRealName(passenger.getRealName());
+                }));
+        // 票价补全：复用首页票价缓存（同键同装载），进程内按坐席过滤，购票路径不落库
+        List<Integer> seatTypes = trainPurchaseTicketResults.stream().map(TrainPurchaseTicketRespDTO::getSeatType).distinct().toList();
+        String trainStationPriceStr = distributedCache.safeGet(
+                String.format(TRAIN_STATION_PRICE, prepare.getTrainId(), prepare.getDeparture(), prepare.getArrival()),
+                String.class,
+                () -> JSON.toJSONString(trainStationPriceMapper.selectList(Wrappers.lambdaQuery(TrainStationPriceDO.class)
+                        .eq(TrainStationPriceDO::getTrainId, prepare.getTrainId())
+                        .eq(TrainStationPriceDO::getDeparture, prepare.getDeparture())
+                        .eq(TrainStationPriceDO::getArrival, prepare.getArrival()))),
+                ADVANCE_TICKET_DAY, TimeUnit.DAYS);
+        Map<Integer, Integer> priceMap = JSON.parseArray(trainStationPriceStr, TrainStationPriceDO.class).stream()
+                .filter(each -> seatTypes.contains(each.getSeatType()))
+                .collect(Collectors.toMap(TrainStationPriceDO::getSeatType, TrainStationPriceDO::getPrice, (a, b) -> a));
+        trainPurchaseTicketResults.forEach(each -> each.setAmount(priceMap.get(each.getSeatType())));
+        List<TicketOrderItemCreateRemoteReqDTO> orderItemCreateRemoteReqDTOList = new ArrayList<>();
+        trainPurchaseTicketResults.forEach(each -> {
+            TicketOrderItemCreateRemoteReqDTO orderItemCreateRemoteReqDTO = TicketOrderItemCreateRemoteReqDTO.builder()
+                    .amount(each.getAmount())
+                    .carriageNumber(each.getCarriageNumber())
+                    .seatNumber(each.getSeatNumber())
+                    .idCard(each.getIdCard())
+                    .idType(each.getIdType())
+                    .phone(each.getPhone())
+                    .seatType(each.getSeatType())
+                    .ticketType(each.getUserType())
+                    .realName(each.getRealName())
+                    .build();
+            TicketOrderDetailRespDTO ticketOrderDetailRespDTO = TicketOrderDetailRespDTO.builder()
+                    .amount(each.getAmount())
+                    .carriageNumber(each.getCarriageNumber())
+                    .seatNumber(each.getSeatNumber())
+                    .idCard(each.getIdCard())
+                    .idType(each.getIdType())
+                    .seatType(each.getSeatType())
+                    .ticketType(each.getUserType())
+                    .realName(each.getRealName())
+                    .build();
+            orderItemCreateRemoteReqDTOList.add(orderItemCreateRemoteReqDTO);
+            ticketOrderDetailResults.add(ticketOrderDetailRespDTO);
+        });
+        // 车站关系（发到时刻）：静态数据走缓存，购票路径不落库
+        TrainStationRelationDO trainStationRelationDO = distributedCache.safeGet(
+                TRAIN_STATION_RELATION_DETAIL + StrUtil.join("_", prepare.getTrainId(), prepare.getDeparture(), prepare.getArrival()),
+                TrainStationRelationDO.class,
+                () -> trainStationRelationMapper.selectOne(Wrappers.lambdaQuery(TrainStationRelationDO.class)
+                        .eq(TrainStationRelationDO::getTrainId, prepare.getTrainId())
+                        .eq(TrainStationRelationDO::getDeparture, prepare.getDeparture())
+                        .eq(TrainStationRelationDO::getArrival, prepare.getArrival())),
+                ADVANCE_TICKET_DAY, TimeUnit.DAYS);
+        TicketOrderCreateRemoteReqDTO orderCreateRemoteReqDTO = TicketOrderCreateRemoteReqDTO.builder()
+                .departure(prepare.getDeparture())
+                .arrival(prepare.getArrival())
+                .orderTime(new Date())
+                .source(SourceEnum.INTERNET.getCode())
+                .trainNumber(prepare.getTrainNumber())
+                .departureTime(trainStationRelationDO.getDepartureTime())
+                .arrivalTime(trainStationRelationDO.getArrivalTime())
+                .ridingDate(trainStationRelationDO.getDepartureTime())
+                .userId(UserContext.getUserId())
+                .username(UserContext.getUsername())
+                .trainId(Long.parseLong(prepare.getTrainId()))
+                .ticketOrderItems(orderItemCreateRemoteReqDTOList)
+                // 购票幂等令牌：订单服务按令牌幂等，防止同步链路与补偿链路并发重复建单
+                .purchaseToken(prepare.getPurchaseToken())
+                .build();
+        ticketOrderResult = ticketOrderRemoteService.createTicketOrder(orderCreateRemoteReqDTO);
+        if (!ticketOrderResult.isSuccess() || StrUtil.isBlank(ticketOrderResult.getData())) {
+            log.error("订单服务调用失败，返回结果：{}", ticketOrderResult.getMessage());
+            throw new ServiceException("订单服务调用失败");
+        }
+        // 订单创建成功，确认发件箱任务完成，补偿扫描器不再投递
+        orderCreateTaskService.confirmByToken(prepare.getPurchaseToken());
         return new TicketPurchaseRespDTO(ticketOrderResult.getData(), ticketOrderDetailResults);
     }
 
-    private void compensateLockFailure(TicketPurchasePrepareDTO prepare) {
+    @Override
+    public void rollbackPurchase(TicketPurchasePrepareDTO prepare) {
         try {
             removeByIds(prepare.getTicketIds());
         } catch (Throwable ex) {
@@ -697,6 +714,7 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
             log.error("[购票补偿] 释放座位失败，车次：{}", prepare.getTrainId(), ex);
         }
         // 余票缓存由展示层刷新器周期从 DB 重算，此处无需回补
+        orderCreateTaskService.cancelByToken(prepare.getPurchaseToken());
     }
 
     @Override

@@ -88,4 +88,9 @@ public class TicketOrderCreateReqDTO {
      * 订单明细
      */
     private List<TicketOrderItemCreateReqDTO> ticketOrderItems;
+
+    /**
+     * 购票幂等令牌：同一令牌仅创建一单（购票服务宕机补偿链路与同步链路并发时防重），可为空
+     */
+    private String purchaseToken;
 }

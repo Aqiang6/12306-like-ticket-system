@@ -64,4 +64,10 @@ public class TicketPurchasePrepareDTO {
      * 座位分配结果（含车厢、座位号、坐席类型、乘车人）
      */
     private List<TrainPurchaseTicketRespDTO> seatResults;
+
+    /**
+     * 购票幂等令牌：与车票账本同事务落库至发件箱（t_order_create_task），
+     * 实例宕机后由补偿链路投递 MQ 重建订单；订单服务以令牌幂等，防止同步与补偿并发重复建单
+     */
+    private String purchaseToken;
 }

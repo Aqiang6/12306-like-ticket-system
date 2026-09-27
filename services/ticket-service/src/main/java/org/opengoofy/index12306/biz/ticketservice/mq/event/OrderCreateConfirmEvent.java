@@ -15,25 +15,33 @@
  * limitations under the License.
  */
 
-package org.opengoofy.index12306.biz.ticketservice.remote.dto;
+package org.opengoofy.index12306.biz.ticketservice.mq.event;
 
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
-
-import java.util.Date;
-import java.util.List;
+import org.opengoofy.index12306.biz.ticketservice.dto.req.TicketPurchasePrepareDTO;
 
 /**
- * 车票订单创建请求参数
+ * 订单创建补偿任务事件
  * 公众号：马丁玩编程，回复：加群，添加马哥微信（备注：12306）获取项目资料
  */
 @Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
-@Builder
-public class TicketOrderCreateRemoteReqDTO {
+public class OrderCreateConfirmEvent {
+
+    /**
+     * 购票幂等令牌（订单服务按令牌幂等创建订单）
+     */
+    private String purchaseToken;
+
+    /**
+     * 用户名（消费者重建用户上下文使用）
+     */
+    private String username;
 
     /**
      * 用户 ID
@@ -41,62 +49,7 @@ public class TicketOrderCreateRemoteReqDTO {
     private String userId;
 
     /**
-     * 用户名
+     * 购票临界区产物上下文
      */
-    private String username;
-
-    /**
-     * 车次 ID
-     */
-    private Long trainId;
-
-    /**
-     * 出发站点
-     */
-    private String departure;
-
-    /**
-     * 到达站点
-     */
-    private String arrival;
-
-    /**
-     * 订单来源
-     */
-    private Integer source;
-
-    /**
-     * 下单时间
-     */
-    private Date orderTime;
-
-    /**
-     * 乘车日期
-     */
-    private Date ridingDate;
-
-    /**
-     * 列车车次
-     */
-    private String trainNumber;
-
-    /**
-     * 出发时间
-     */
-    private Date departureTime;
-
-    /**
-     * 到达时间
-     */
-    private Date arrivalTime;
-
-    /**
-     * 订单明细
-     */
-    private List<TicketOrderItemCreateRemoteReqDTO> ticketOrderItems;
-
-    /**
-     * 购票幂等令牌：同一令牌订单服务仅创建一单，防止同步链路与宕机补偿链路并发重复建单
-     */
-    private String purchaseToken;
+    private TicketPurchasePrepareDTO prepare;
 }

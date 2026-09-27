@@ -73,12 +73,29 @@ public interface TicketService extends IService<TicketDO> {
 
     /**
      * 创建订单（购票锁外执行）
-     * 创建失败时补偿释放已锁座位、删除车票记录并回补余票缓存
+     * 创建失败时补偿释放已锁座位、删除车票记录、作废补偿任务并回补余票缓存
      *
      * @param prepare 购票临界区产物上下文
      * @return 订单号及车票详情
      */
     TicketPurchaseRespDTO createTicketOrder(TicketPurchasePrepareDTO prepare);
+
+    /**
+     * 订单创建（无补偿版本）：失败直接抛出异常，不回滚账本，供补偿消费者重试场景复用；
+     * 成功后确认发件箱任务（t_order_create_task）为已完成
+     *
+     * @param prepare 购票临界区产物上下文
+     * @return 订单号及车票详情
+     */
+    TicketPurchaseRespDTO doCreateTicketOrder(TicketPurchasePrepareDTO prepare);
+
+    /**
+     * 购票事务回滚：删除车票账本记录、释放已锁座位并作废补偿任务；
+     * 供同步链路补偿与补偿消费者重试超限兜底复用
+     *
+     * @param prepare 购票临界区产物上下文
+     */
+    void rollbackPurchase(TicketPurchasePrepareDTO prepare);
 
     /**
      * 支付单详情查询

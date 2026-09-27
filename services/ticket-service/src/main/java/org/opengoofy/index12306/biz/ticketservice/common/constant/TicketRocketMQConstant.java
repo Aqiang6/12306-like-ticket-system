@@ -39,6 +39,21 @@ public final class TicketRocketMQConstant {
     public static final String TICKET_DELAY_CLOSE_CG_KEY = "index12306_ticket-service_delay-close-order_cg${unique-name:}";
 
     /**
+     * 订单创建补偿任务 Topic Key：实例宕机导致"账本已落库、订单未创建"时，扫描任务投递此 Topic 重建订单
+     */
+    public static final String ORDER_CREATE_CONFIRM_TOPIC_KEY = "index12306_ticket-service_order-create-confirm_topic${unique-name:}";
+
+    /**
+     * 订单创建补偿任务 Tag Key
+     */
+    public static final String ORDER_CREATE_CONFIRM_TAG_KEY = "index12306_ticket-service_order-create-confirm_tag${unique-name:}";
+
+    /**
+     * 订单创建补偿任务消费者组 Key
+     */
+    public static final String ORDER_CREATE_CONFIRM_CG_KEY = "index12306_ticket-service_order-create-confirm_cg${unique-name:}";
+
+    /**
      * Canal 监听数据库余票变更 Topic Key
      */
     public static final String CANAL_COMMON_SYNC_TOPIC_KEY = "index12306_canal_ticket-service_common-sync_topic${unique-name:}";
