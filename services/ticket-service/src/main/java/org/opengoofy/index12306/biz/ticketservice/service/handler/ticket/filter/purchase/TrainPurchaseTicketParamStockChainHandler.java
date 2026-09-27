@@ -22,6 +22,7 @@ import lombok.RequiredArgsConstructor;
 import org.opengoofy.index12306.biz.ticketservice.dto.domain.PurchaseTicketPassengerDetailDTO;
 import org.opengoofy.index12306.biz.ticketservice.dto.req.PurchaseTicketReqDTO;
 import org.opengoofy.index12306.biz.ticketservice.service.cache.SeatMarginCacheLoader;
+import org.opengoofy.index12306.biz.ticketservice.service.cache.TicketStockDisplayRefresher;
 import org.opengoofy.index12306.framework.starter.cache.DistributedCache;
 import org.opengoofy.index12306.framework.starter.convention.exception.ClientException;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -44,6 +45,7 @@ public class TrainPurchaseTicketParamStockChainHandler implements TrainPurchaseT
 
     private final SeatMarginCacheLoader seatMarginCacheLoader;
     private final DistributedCache distributedCache;
+    private final TicketStockDisplayRefresher ticketStockDisplayRefresher;
 
     @Override
     public void handler(PurchaseTicketReqDTO requestParam) {
@@ -62,6 +64,9 @@ public class TrainPurchaseTicketParamStockChainHandler implements TrainPurchaseT
             if (stock >= passengerSeatDetails.size()) {
                 return;
             }
+            // 零点即时广播：售罄即刻置位标志，正在排队的等待线程最迟 200ms 内退出，无需等待刷新器周期或超时上限
+            ticketStockDisplayRefresher.markSoldOut(String.valueOf(requestParam.getTrainId()),
+                    requestParam.getDeparture(), requestParam.getArrival(), seatTypeMap.keySet());
             throw new ClientException("车票已售完，您可提交候补订单或选择其他车次");
         });
     }

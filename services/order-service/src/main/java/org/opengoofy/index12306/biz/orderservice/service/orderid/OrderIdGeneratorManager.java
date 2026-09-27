@@ -46,7 +46,10 @@ public final class OrderIdGeneratorManager implements InitializingBean {
      * @return 订单 ID
      */
     public static String generateId(long userId) {
-        return DISTRIBUTED_ID_GENERATOR.generateId() + String.valueOf(userId % 1000000);
+        // 后缀必须固定 6 位（零填充）：分片算法按 order_sn 后 6 位路由（closeTickOrder 仅带 order_sn），
+        // 若 userId % 1000000 不足 6 位丢失前导零，插入（user_id 路由）与关闭（order_sn 路由）会落到不同分片表，
+        // 导致延迟关单查不到订单、座位永不释放
+        return DISTRIBUTED_ID_GENERATOR.generateId() + String.format("%06d", userId % 1000000);
     }
 
     @Override

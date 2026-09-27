@@ -25,13 +25,13 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.opengoofy.index12306.biz.ticketservice.common.constant.RedisKeyConstant;
-import org.opengoofy.index12306.biz.ticketservice.common.enums.SeatStatusEnum;
 import org.opengoofy.index12306.biz.ticketservice.dao.entity.SeatDO;
 import org.opengoofy.index12306.biz.ticketservice.dao.entity.TrainStationDO;
 import org.opengoofy.index12306.biz.ticketservice.dao.entity.CarriageDO;
 import org.opengoofy.index12306.biz.ticketservice.dao.mapper.CarriageMapper;
 import org.opengoofy.index12306.biz.ticketservice.dao.mapper.SeatMapper;
 import org.opengoofy.index12306.biz.ticketservice.dao.mapper.TrainStationMapper;
+import org.opengoofy.index12306.biz.ticketservice.dto.domain.SeatTypeCountDTO;
 import org.opengoofy.index12306.biz.ticketservice.toolkit.SeatBitMapUtil;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
@@ -110,6 +110,14 @@ public class TicketStockDisplayRefresher {
      */
     private final Map<String, Boolean> soldOutFlags = new java.util.concurrent.ConcurrentHashMap<>();
 
+    /**
+     * 售罄恢复计数：标志清除采用粘滞窗口——余票恢复 > 0 需连续 RECOVER_CYCLES 个刷新周期才清除标志，
+     * 防止自动关单回补座位导致余票在 0 与正数间抖动、等待线程永远观察不到售罄而拖到超时上限
+     */
+    private final Map<String, Integer> soldOutRecoverCounters = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static final int SOLD_OUT_RECOVER_CYCLES = 2;
+
     private ScheduledExecutorService scheduler;
 
     @PostConstruct
@@ -142,6 +150,18 @@ public class TicketStockDisplayRefresher {
         return false;
     }
 
+    /**
+     * 零点即时广播：购票链路观测到余票不足时同步置位售罄标志，
+     * 无需等待刷新器下一个 3s 周期，等待线程最迟 200ms 内退出队列
+     */
+    public void markSoldOut(String trainId, String departure, String arrival, java.util.Collection<Integer> seatTypes) {
+        for (Integer seatType : seatTypes) {
+            String key = trainId + "_" + departure + "_" + arrival + "_" + seatType;
+            soldOutFlags.put(key, Boolean.TRUE);
+            soldOutRecoverCounters.remove(key);
+        }
+    }
+
     private void updateSoldOutFlags(String trainId, List<String> stations, Map<Integer, int[]> countsBySeatType) {
         int comboIdx = 0;
         for (int dep = 0; dep < stations.size() - 1; dep++) {
@@ -151,8 +171,12 @@ public class TicketStockDisplayRefresher {
                     String flagKey = comboKey + entry.getKey();
                     if (entry.getValue()[comboIdx] <= 0) {
                         soldOutFlags.put(flagKey, Boolean.TRUE);
-                    } else {
+                        soldOutRecoverCounters.remove(flagKey);
+                    } else if (soldOutFlags.containsKey(flagKey)
+                            && soldOutRecoverCounters.merge(flagKey, 1, Integer::sum) >= SOLD_OUT_RECOVER_CYCLES) {
+                        // 粘滞窗口：余票连续多个周期 > 0 才认定恢复，避免关单回补导致的标志抖动
                         soldOutFlags.remove(flagKey);
+                        soldOutRecoverCounters.remove(flagKey);
                     }
                 }
                 comboIdx++;
@@ -167,6 +191,13 @@ public class TicketStockDisplayRefresher {
         if (StrUtil.isNotBlank(trainId)) {
             activeTrains.put(trainId, Boolean.TRUE);
         }
+    }
+
+    /**
+     * 当前活跃车次快照（供对账任务复用同一活跃集合，避免重复维护）
+     */
+    public java.util.Set<String> activeTrainIds() {
+        return activeTrains.asMap().keySet();
     }
 
     private void refreshAll() {
@@ -321,14 +352,14 @@ public class TicketStockDisplayRefresher {
         int comboIdx = 0;
         for (int dep = 0; dep < stations.size() - 1; dep++) {
             for (int arr = dep + 1; arr < stations.size(); arr++) {
+                // 账本重叠语义：t_seat 为注册表，可用座位数 = 不与有效票区间重叠的注册座位数
+                List<SeatTypeCountDTO> countList = seatService.listSeatTypeCount(Long.valueOf(trainId),
+                        stations.get(dep), stations.get(arr), seatTypes);
+                Map<Integer, Integer> countByType = countList.stream()
+                        .collect(Collectors.toMap(SeatTypeCountDTO::getSeatType, SeatTypeCountDTO::getSeatCount, (a, b) -> a));
                 for (Integer seatType : seatTypes) {
-                    Long count = seatMapper.selectCount(Wrappers.lambdaQuery(SeatDO.class)
-                            .eq(SeatDO::getTrainId, Long.valueOf(trainId))
-                            .eq(SeatDO::getSeatType, seatType)
-                            .eq(SeatDO::getStartStation, stations.get(dep))
-                            .eq(SeatDO::getEndStation, stations.get(arr))
-                            .eq(SeatDO::getSeatStatus, SeatStatusEnum.AVAILABLE.getCode()));
-                    countsBySeatType.computeIfAbsent(seatType, k -> new int[stationCount * (stationCount - 1) / 2])[comboIdx] = count.intValue();
+                    countsBySeatType.computeIfAbsent(seatType, k -> new int[stationCount * (stationCount - 1) / 2])[comboIdx] =
+                            countByType.getOrDefault(seatType, 0);
                 }
                 comboIdx++;
             }

@@ -19,34 +19,70 @@
 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="org.opengoofy.index12306.biz.ticketservice.dao.mapper.SeatMapper">
 
-    <!-- 获取列车车厢余票集合 -->
-    <select id="listSeatRemainingTicket" parameterType="org.opengoofy.index12306.biz.ticketservice.dao.entity.SeatDO"
-            resultType="Integer">
-        select count(*) as count
-        from t_seat
-        where train_id = #{seatDO.trainId}
-        and start_station = #{seatDO.startStation}
-        and end_station = #{seatDO.endStation}
-        and seat_status = '0'
-        and carriage_number in
+    <!--
+      可用性判断统一按 t_ticket 售卖区间账本重叠语义：
+      座位在 [departure, arrival) 可用 = 不存在任何有效票（UNPAID/PAID/BOARDED）与其区间重叠
+      有效票区间采用半开区间 [departure, arrival)，重叠条件：t.departure < arrival AND t.arrival > departure
+    -->
+    <sql id="seatFreeOnInterval">
+        and not exists (
+            select 1 from t_ticket t
+            where t.train_id = s.train_id
+              and t.carriage_number = s.carriage_number
+              and t.seat_number = s.seat_number
+              and t.ticket_status in (0, 1, 2)
+              and t.del_flag = 0
+              and t.departure &lt; #{arrival}
+              and t.arrival &gt; #{departure}
+        )
+    </sql>
+
+    <!-- 获取列车指定车厢在区间内可用座位数，按车厢聚合 -->
+    <select id="listCarriageSeatCount" resultType="org.opengoofy.index12306.biz.ticketservice.dto.domain.CarriageSeatCountDTO">
+        select s.carriage_number as carriageNumber, count(*) as seatCount
+        from t_seat s
+        where s.train_id = #{trainId}
+        and s.del_flag = 0
+        and s.carriage_number in
         <foreach collection="trainCarriageList" item="carriage" open="(" separator="," close=")">
             #{carriage}
         </foreach>
-        group by carriage_number
+        <include refid="seatFreeOnInterval"/>
+        group by s.carriage_number
     </select>
 
     <select id="listSeatTypeCount" resultType="org.opengoofy.index12306.biz.ticketservice.dto.domain.SeatTypeCountDTO">
-        select seat_type as seatType, count(*) as seatCount
-        from t_seat
-        where train_id = #{trainId}
-        and start_station = #{startStation}
-        and end_station = #{endStation}
-        and seat_status = '0'
-        and seat_type in
+        select s.seat_type as seatType, count(*) as seatCount
+        from t_seat s
+        where s.train_id = #{trainId}
+        and s.del_flag = 0
+        and s.seat_type in
         <foreach collection="seatTypes" item="seatType" open="(" separator="," close=")">
             #{seatType}
         </foreach>
-        group by seat_type
-        having seatCount > 0
+        and not exists (
+            select 1 from t_ticket t
+            where t.train_id = s.train_id
+              and t.carriage_number = s.carriage_number
+              and t.seat_number = s.seat_number
+              and t.ticket_status in (0, 1, 2)
+              and t.del_flag = 0
+              and t.departure &lt; #{endStation}
+              and t.arrival &gt; #{startStation}
+        )
+        group by s.seat_type
+        having seatCount &gt; 0
+    </select>
+
+    <!-- 指定车厢区间可用座位号（位图缺失时的数据库兜底） -->
+    <select id="listAvailableSeatNumber" resultType="String">
+        select s.seat_number
+        from t_seat s
+        where s.train_id = #{trainId}
+        and s.carriage_number = #{carriageNumber}
+        and s.seat_type = #{seatType}
+        and s.del_flag = 0
+        <include refid="seatFreeOnInterval"/>
+        order by s.seat_number
     </select>
 </mapper>

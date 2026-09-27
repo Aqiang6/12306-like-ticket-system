@@ -25,9 +25,12 @@ import lombok.NoArgsConstructor;
 import org.opengoofy.index12306.framework.starter.database.base.BaseDO;
 
 /**
- * 车票实体
- * 公众号：马丁玩编程，回复：加群，添加马哥微信（备注：12306）获取项目资料
+ * 车票实体（本地售卖区间账本：一张有效票即一个座位在 [departure, arrival) 区间的占用事实）
+ *
+ * <p>库存模型已重构：t_seat 退化为物理座位注册表，座位占用由本表（有效状态票记录）
+ * 与 Redis 座位区间占用位图表达；有效状态 = UNPAID/PAID/BOARDED，其余状态不占座。
  */
+
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
@@ -69,4 +72,14 @@ public class TicketDO extends BaseDO {
      * 车票状态
      */
     private Integer ticketStatus;
+
+    /**
+     * 出发站点（售卖区间起点）
+     */
+    private String departure;
+
+    /**
+     * 到达站点（售卖区间终点）
+     */
+    private String arrival;
 }

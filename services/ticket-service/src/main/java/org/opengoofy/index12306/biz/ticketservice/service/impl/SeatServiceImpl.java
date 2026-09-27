@@ -20,69 +20,80 @@ package org.opengoofy.index12306.biz.ticketservice.service.impl;
 import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.opengoofy.index12306.biz.ticketservice.common.enums.SeatStatusEnum;
+import org.opengoofy.index12306.biz.ticketservice.common.enums.TicketStatusEnum;
 import org.opengoofy.index12306.biz.ticketservice.dao.entity.SeatDO;
-import org.opengoofy.index12306.biz.ticketservice.dao.entity.TrainStationDO;
+import org.opengoofy.index12306.biz.ticketservice.dao.entity.TicketDO;
 import org.opengoofy.index12306.biz.ticketservice.dao.mapper.SeatMapper;
-import org.opengoofy.index12306.biz.ticketservice.dao.mapper.TrainStationMapper;
-import org.opengoofy.index12306.biz.ticketservice.dto.domain.RouteDTO;
+import org.opengoofy.index12306.biz.ticketservice.dao.mapper.TicketMapper;
+import org.opengoofy.index12306.biz.ticketservice.dto.domain.CarriageSeatCountDTO;
 import org.opengoofy.index12306.biz.ticketservice.dto.domain.SeatTypeCountDTO;
 import org.opengoofy.index12306.biz.ticketservice.service.SeatService;
-import org.opengoofy.index12306.biz.ticketservice.service.TrainStationService;
 import org.opengoofy.index12306.biz.ticketservice.service.handler.ticket.dto.TrainPurchaseTicketRespDTO;
+import org.opengoofy.index12306.biz.ticketservice.toolkit.SeatBitMapAssembler;
 import org.opengoofy.index12306.biz.ticketservice.toolkit.SeatBitMapUtil;
 import org.opengoofy.index12306.framework.starter.cache.DistributedCache;
 import org.opengoofy.index12306.framework.starter.convention.exception.ServiceException;
-import org.redisson.api.RLock;
-import org.redisson.api.RedissonClient;
-import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.RedisCallback;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.script.RedisScript;
+import org.springframework.data.redis.core.types.Expiration;
+import org.springframework.data.redis.connection.RedisStringCommands.SetOption;
+import org.springframework.scripting.support.ResourceScriptSource;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-import static org.opengoofy.index12306.biz.ticketservice.common.constant.RedisKeyConstant.LOCK_SEAT_BIT_MAP;
-import static org.opengoofy.index12306.biz.ticketservice.common.constant.RedisKeyConstant.TRAIN_CARRIAGE_SEAT_STATUS;
-import java.util.HashSet;
-import java.util.Set;
-
 import static org.opengoofy.index12306.biz.ticketservice.common.constant.RedisKeyConstant.TRAIN_STATION_CARRIAGE_REMAINING_TICKET;
-import static org.opengoofy.index12306.biz.ticketservice.common.constant.RedisKeyConstant.TRAIN_STATION_REMAINING_TICKET;
 
 /**
  * 座位接口层实现
  *
- * <p>座位占用状态以 Redis BitMap 为读取与写入的第一入口（对齐 12306 项目余票 BitMap 方案）：
- * 每个车厢一个位图，每个座位按沿途相邻站段各占一个 bit，bit=1 已售出占用、bit=0 空闲。
- * 可用座位查询优先走位图，位图缺失时从 {@code t_seat} 全量重建；
- * 锁座先置位图再落库（条件更新防超卖），释放先落库再清位图——任意失败顺序都保证
- * "位图占用 ≥ 数据库占用"，宁可少卖不会超卖。位图可随时由数据库重建。
+ * <p>库存模型（重构后）：Redis 座位区间占用位图是热路径唯一准入（锁座经 Lua 脚本"预检 + 置位"整单原子），
+ * {@code t_ticket} 售卖区间账本是持久事实，{@code t_seat} 仅为物理座位注册表。
+ * 位图可随时由"注册表 + 账本"全量组装，内存构建后以 {@code SET NX} 一次写入，
+ * 无需分布式锁（NX 天然裁决唯一写入者）；可用座位查询优先走位图，位图缺失回退账本重叠查询。
  *
- * 公众号：马丁玩编程，回复：加群，添加马哥微信（备注：12306）获取项目资料
+ * <p>防超卖层次：位图 Lua CAS（热路径唯一裁决）→ 购票公平锁（trainId+seatType 串行化，兜底无位图席别）
+ * → 对账任务周期比对位图与账本并修复漂移。
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class SeatServiceImpl extends ServiceImpl<SeatMapper, SeatDO> implements SeatService {
 
+    private static final String LUA_SEAT_INTERVAL_LOCK_PATH = "lua/seat_interval_lock.lua";
+
     private final SeatMapper seatMapper;
-    private final TrainStationService trainStationService;
+    private final TicketMapper ticketMapper;
+    private final SeatBitMapAssembler seatBitMapAssembler;
     private final DistributedCache distributedCache;
-    private final TrainStationMapper trainStationMapper;
-    private final RedissonClient redissonClient;
+
+    /**
+     * 整单原子锁座脚本：预检全部座位目标站段 bit 空闲才统一置 1，任一占用则整单失败
+     */
+    private static final RedisScript<Long> SEAT_INTERVAL_LOCK_SCRIPT;
+
+    static {
+        DefaultRedisScript<Long> script = new DefaultRedisScript<>();
+        script.setScriptSource(new ResourceScriptSource(new ClassPathResource(LUA_SEAT_INTERVAL_LOCK_PATH)));
+        script.setResultType(Long.class);
+        SEAT_INTERVAL_LOCK_SCRIPT = script;
+    }
 
     @Override
     public void initSeatBitMap(String trainId, String carriageNumber) {
@@ -98,16 +109,16 @@ public class SeatServiceImpl extends ServiceImpl<SeatMapper, SeatDO> implements 
     }
 
     /**
-     * 从座位区间占用位图查询可用座位（先走 Redis BitMap，位图缺失时由数据库重建）
+     * 从座位区间占用位图查询可用座位（位图缺失时由注册表 + 账本组装，组装失败回退数据库重叠查询）
      */
     private List<String> listAvailableSeatFromBitMap(String trainId, String carriageNumber, Integer seatType, String departure, String arrival) {
         String key = SeatBitMapUtil.buildKey(trainId, carriageNumber);
         ensureSeatBitMapExists(trainId, carriageNumber, key);
         if (!distributedCache.hasKey(key)) {
-            // 位图初始化被跳过（席别不支持或无座位数据）：回退数据库查询，避免将缺失位图误判为全部空闲
+            // 位图组装被跳过（席别不支持或无座位数据）：回退数据库重叠查询，避免将缺失位图误判为全部空闲
             return listAvailableSeatFromDataBase(trainId, carriageNumber, seatType, departure, arrival);
         }
-        List<String> stations = listStationOrdered(trainId);
+        List<String> stations = seatBitMapAssembler.listStationOrdered(trainId);
         int departureIdx = stations.indexOf(departure);
         int arrivalIdx = stations.indexOf(arrival);
         if (departureIdx < 0 || arrivalIdx <= departureIdx) {
@@ -134,19 +145,10 @@ public class SeatServiceImpl extends ServiceImpl<SeatMapper, SeatDO> implements 
     }
 
     /**
-     * 从数据库查询可用座位（非高铁席别等未定义座位布局的场景沿用）
+     * 从数据库查询可用座位（物理座位注册表剔除与有效票区间重叠者）
      */
     private List<String> listAvailableSeatFromDataBase(String trainId, String carriageNumber, Integer seatType, String departure, String arrival) {
-        LambdaQueryWrapper<SeatDO> queryWrapper = Wrappers.lambdaQuery(SeatDO.class)
-                .eq(SeatDO::getTrainId, trainId)
-                .eq(SeatDO::getCarriageNumber, carriageNumber)
-                .eq(SeatDO::getSeatType, seatType)
-                .eq(SeatDO::getStartStation, departure)
-                .eq(SeatDO::getEndStation, arrival)
-                .eq(SeatDO::getSeatStatus, SeatStatusEnum.AVAILABLE.getCode())
-                .select(SeatDO::getSeatNumber);
-        List<SeatDO> seatDOList = seatMapper.selectList(queryWrapper);
-        return seatDOList.stream().map(SeatDO::getSeatNumber).collect(Collectors.toList());
+        return seatMapper.listAvailableSeatNumber(Long.valueOf(trainId), carriageNumber, seatType, departure, arrival);
     }
 
     @Override
@@ -160,26 +162,37 @@ public class SeatServiceImpl extends ServiceImpl<SeatMapper, SeatDO> implements 
                 return trainStationCarriageRemainingTicket.stream().map(each -> Integer.parseInt(each.toString())).collect(Collectors.toList());
             }
         }
-        SeatDO seatDO = SeatDO.builder()
-                .trainId(Long.parseLong(trainId))
-                .startStation(departure)
-                .endStation(arrival)
-                .build();
-        return seatMapper.listSeatRemainingTicket(seatDO, trainCarriageList);
+        // 数据库兜底：按账本重叠语义统计各车厢可用座位数，并按入参车厢顺序对齐（缺失车厢计 0）
+        List<CarriageSeatCountDTO> countList = seatMapper.listCarriageSeatCount(Long.valueOf(trainId), departure, arrival, trainCarriageList);
+        Map<String, Integer> countByCarriage = countList.stream()
+                .collect(Collectors.toMap(CarriageSeatCountDTO::getCarriageNumber, CarriageSeatCountDTO::getSeatCount, (a, b) -> a));
+        return trainCarriageList.stream()
+                .map(carriage -> countByCarriage.getOrDefault(carriage, 0))
+                .collect(Collectors.toList());
     }
 
     @Override
     public List<String> listUsableCarriageNumber(String trainId, Integer carriageType, String departure, String arrival) {
-        LambdaQueryWrapper<SeatDO> queryWrapper = Wrappers.lambdaQuery(SeatDO.class)
-                .eq(SeatDO::getTrainId, trainId)
+        // 注册表提供候选车厢（静态数据），再按账本重叠语义保留区间内仍有可用座位的车厢
+        List<String> candidateCarriages = lambdaQuery()
+                .eq(SeatDO::getTrainId, Long.valueOf(trainId))
                 .eq(SeatDO::getSeatType, carriageType)
-                .eq(SeatDO::getStartStation, departure)
-                .eq(SeatDO::getEndStation, arrival)
-                .eq(SeatDO::getSeatStatus, SeatStatusEnum.AVAILABLE.getCode())
                 .groupBy(SeatDO::getCarriageNumber)
-                .select(SeatDO::getCarriageNumber);
-        List<SeatDO> seatDOList = seatMapper.selectList(queryWrapper);
-        return seatDOList.stream().map(SeatDO::getCarriageNumber).collect(Collectors.toList());
+                .select(SeatDO::getCarriageNumber)
+                .list()
+                .stream()
+                .map(SeatDO::getCarriageNumber)
+                .sorted(Comparator.naturalOrder())
+                .collect(Collectors.toList());
+        if (candidateCarriages.isEmpty()) {
+            return candidateCarriages;
+        }
+        List<CarriageSeatCountDTO> countList = seatMapper.listCarriageSeatCount(Long.valueOf(trainId), departure, arrival, candidateCarriages);
+        return countList.stream()
+                .filter(each -> each.getSeatCount() != null && each.getSeatCount() > 0)
+                .map(CarriageSeatCountDTO::getCarriageNumber)
+                .sorted(Comparator.naturalOrder())
+                .collect(Collectors.toList());
     }
 
     @Override
@@ -189,118 +202,90 @@ public class SeatServiceImpl extends ServiceImpl<SeatMapper, SeatDO> implements 
 
     @Override
     public void lockSeat(String trainId, String departure, String arrival, List<TrainPurchaseTicketRespDTO> trainPurchaseTicketRespList) {
-        // 位图先行：先走 redis bitmap 写入占用，再落数据库——失败顺序保证"位图占用 ≥ 数据库占用"，宁可少卖不会超卖
+        // 位图先行：Lua 脚本内"预检 + 置位"整单原子（all-or-nothing），随后账本落库由调用方事务完成。
+        // 席别不支持位图的座位（卧铺等）不参与位图，由购票公平锁（trainId+seatType）串行化保证不超卖。
+        List<String> stations = seatBitMapAssembler.listStationOrdered(trainId);
+        int departureIdx = stations.indexOf(departure);
+        int arrivalIdx = stations.indexOf(arrival);
+        if (departureIdx < 0 || arrivalIdx <= departureIdx) {
+            throw new ServiceException("列车站点信息不合法，座位锁定失败");
+        }
+        int stationCount = stations.size();
+        StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
+        // 一次锁座可能跨车厢（如二等座跨车厢降级分配）：按位图 Key 分组，组内记录各座位站段偏移
         Map<String, List<Long>> occupiedBitOffsets = new LinkedHashMap<>();
-        List<RouteDTO> routeList = trainStationService.listTakeoutTrainStationRoute(trainId, departure, arrival);
-        try {
-            List<String> stations = listStationOrdered(trainId);
-            int departureIdx = stations.indexOf(departure);
-            int arrivalIdx = stations.indexOf(arrival);
-            if (departureIdx < 0 || arrivalIdx <= departureIdx) {
-                throw new ServiceException("列车站点信息不合法，座位锁定失败");
-            }
-            int stationCount = stations.size();
-            StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
-            for (TrainPurchaseTicketRespDTO each : trainPurchaseTicketRespList) {
-                if (!SeatBitMapUtil.supports(each.getSeatType())) {
-                    continue;
-                }
-                int seatIndex = SeatBitMapUtil.seatIndexOf(each.getSeatType(), each.getSeatNumber());
-                if (seatIndex < 0) {
-                    continue;
-                }
-                // 一次锁座可能跨车厢（如二等座跨车厢降级分配），位图 Key 按座位所在车厢区分
-                String bitMapKey = SeatBitMapUtil.buildKey(trainId, each.getCarriageNumber());
-                List<Long> offsets = occupiedBitOffsets.computeIfAbsent(bitMapKey, k -> new ArrayList<>());
-                for (int segmentIdx = departureIdx; segmentIdx < arrivalIdx; segmentIdx++) {
-                    long offset = SeatBitMapUtil.bitOffset(seatIndex, stationCount, segmentIdx);
-                    stringRedisTemplate.opsForValue().setBit(bitMapKey, offset, true);
-                    offsets.add(offset);
-                }
-            }
-        } catch (ServiceException ex) {
-            clearSeatBitMap(occupiedBitOffsets);
-            throw ex;
-        } catch (Throwable ex) {
-            clearSeatBitMap(occupiedBitOffsets);
-            log.error("[锁座] 车次：{} 区间：{}→{} 写入座位占用位图失败", trainId, departure, arrival, ex);
-            throw new ServiceException("座位锁定失败，请稍后重试");
-        }
-        // 数据库落库：仅当座位沿途区段均为 AVAILABLE 时才允许锁定，防止位图与数据库短暂不一致时超卖；
-        // 同一座位的全部站段组合行合并为一条 UPDATE，减少临界区内的数据库往返
-        Set<String> conflictedSeats = new HashSet<>();
         for (TrainPurchaseTicketRespDTO each : trainPurchaseTicketRespList) {
-            LambdaUpdateWrapper<SeatDO> updateWrapper = Wrappers.lambdaUpdate(SeatDO.class)
-                    .eq(SeatDO::getTrainId, trainId)
-                    .eq(SeatDO::getCarriageNumber, each.getCarriageNumber())
-                    .eq(SeatDO::getSeatNumber, each.getSeatNumber())
-                    .eq(SeatDO::getSeatStatus, SeatStatusEnum.AVAILABLE.getCode())
-                    .and(wrapper -> {
-                        for (RouteDTO item : routeList) {
-                            wrapper.or(x -> x.eq(SeatDO::getStartStation, item.getStartStation())
-                                    .eq(SeatDO::getEndStation, item.getEndStation()));
-                        }
-                    });
-            SeatDO updateSeatDO = SeatDO.builder()
-                    .seatStatus(SeatStatusEnum.LOCKED.getCode())
-                    .build();
-            if (seatMapper.update(updateSeatDO, updateWrapper) < routeList.size()) {
-                conflictedSeats.add(each.getCarriageNumber() + "_" + each.getSeatNumber());
+            if (!SeatBitMapUtil.supports(each.getSeatType())) {
+                continue;
+            }
+            int seatIndex = SeatBitMapUtil.seatIndexOf(each.getSeatType(), each.getSeatNumber());
+            if (seatIndex < 0) {
+                continue;
+            }
+            String bitMapKey = SeatBitMapUtil.buildKey(trainId, each.getCarriageNumber());
+            List<Long> offsets = occupiedBitOffsets.computeIfAbsent(bitMapKey, k -> new ArrayList<>());
+            for (int segmentIdx = departureIdx; segmentIdx < arrivalIdx; segmentIdx++) {
+                offsets.add(SeatBitMapUtil.bitOffset(seatIndex, stationCount, segmentIdx));
             }
         }
-        if (!conflictedSeats.isEmpty()) {
-            // 相信 DB：冲突座位在 DB 中已被占用，位图同步标记占用——清回空闲会固化"幻影空闲"座位，
-            // 导致后续请求在同一个座位上反复冲突；未冲突座位随本事务回滚恢复可售，位图一并释放；
-            // 同时按扣减对称回补余票缓存，避免冲突造成库存缓存泄漏（缓存小于真实库存引发误拒）
-            StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
-            List<String> stations = listStationOrdered(trainId);
-            int departureIdx = stations.indexOf(departure);
-            int arrivalIdx = stations.indexOf(arrival);
-            int stationCount = stations.size();
-            for (TrainPurchaseTicketRespDTO each : trainPurchaseTicketRespList) {
-                if (!SeatBitMapUtil.supports(each.getSeatType())) {
-                    continue;
-                }
-                int seatIndex = SeatBitMapUtil.seatIndexOf(each.getSeatType(), each.getSeatNumber());
-                if (seatIndex < 0) {
-                    continue;
-                }
-                String bitMapKey = SeatBitMapUtil.buildKey(trainId, each.getCarriageNumber());
-                boolean seatConflict = conflictedSeats.contains(each.getCarriageNumber() + "_" + each.getSeatNumber());
-                for (int segmentIdx = departureIdx; segmentIdx < arrivalIdx; segmentIdx++) {
-                    stringRedisTemplate.opsForValue().setBit(bitMapKey, SeatBitMapUtil.bitOffset(seatIndex, stationCount, segmentIdx), seatConflict);
-                }
+        if (occupiedBitOffsets.isEmpty()) {
+            return;
+        }
+        // 位图缺失即席别不匹配/无座位数据， CAS 前先保证就绪（组装 + SET NX，无锁、毫秒级）
+        for (String bitMapKey : occupiedBitOffsets.keySet()) {
+            String carriageNumber = bitMapKey.substring(bitMapKey.lastIndexOf('_') + 1);
+            ensureSeatBitMapExists(trainId, carriageNumber, bitMapKey);
+            if (!distributedCache.hasKey(bitMapKey)) {
+                throw new ServiceException("座位锁定失败，请稍后重试");
             }
-            // 余票缓存的回补由预占层单点负责（purchaseTicketsV2 catch），此处只修正位图，避免多重回补
+        }
+        // KEYS: 车厢位图 Key；ARGV: [座位数, (Key 下标, 站段数, offset...)...]
+        List<String> keys = new ArrayList<>(occupiedBitOffsets.keySet());
+        Map<String, Integer> keyIndexMap = new HashMap<>(keys.size());
+        for (int i = 0; i < keys.size(); i++) {
+            keyIndexMap.put(keys.get(i), i + 1);
+        }
+        List<String> args = new ArrayList<>(1 + occupiedBitOffsets.values().stream().mapToInt(List::size).sum() + occupiedBitOffsets.size() * 2);
+        args.add(String.valueOf(occupiedBitOffsets.size()));
+        for (Map.Entry<String, List<Long>> entry : occupiedBitOffsets.entrySet()) {
+            args.add(String.valueOf(keyIndexMap.get(entry.getKey())));
+            args.add(String.valueOf(entry.getValue().size()));
+            entry.getValue().forEach(offset -> args.add(String.valueOf(offset)));
+        }
+        // 注意 execute 的 args 是可变参数：必须摊平为数组传入，否则整个 List 会被当作单个 ARGV
+        Long success = stringRedisTemplate.execute(SEAT_INTERVAL_LOCK_SCRIPT, keys, args.toArray(new String[0]));
+        if (success == null || success != 1L) {
             throw new ServiceException("座位已被占用，请重新选择");
         }
     }
 
     @Override
     public void unlock(String trainId, String departure, String arrival, List<TrainPurchaseTicketRespDTO> trainPurchaseTicketResults) {
-        // 数据库先行释放，再清理位图占用；位图清理失败只会"少卖"不会"超卖"，尽力而为并记录日志
-        List<RouteDTO> routeList = trainStationService.listTakeoutTrainStationRoute(trainId, departure, arrival);
-        trainPurchaseTicketResults.forEach(each -> routeList.forEach(item -> {
-            LambdaUpdateWrapper<SeatDO> updateWrapper = Wrappers.lambdaUpdate(SeatDO.class)
-                    .eq(SeatDO::getTrainId, trainId)
-                    .eq(SeatDO::getCarriageNumber, each.getCarriageNumber())
-                    .eq(SeatDO::getStartStation, item.getStartStation())
-                    .eq(SeatDO::getEndStation, item.getEndStation())
-                    .eq(SeatDO::getSeatNumber, each.getSeatNumber());
-            SeatDO updateSeatDO = SeatDO.builder()
-                    .seatStatus(SeatStatusEnum.AVAILABLE.getCode())
-                    .build();
-            seatMapper.update(updateSeatDO, updateWrapper);
-        }));
+        // 1. 账本作废：该座位在该区间的有效票记录流转为 CLOSED。
+        //    退款/改签路径已先行把账本流转为 REFUNDED/CHANGED 的记录不会被匹配，天然幂等。
+        for (TrainPurchaseTicketRespDTO each : trainPurchaseTicketResults) {
+            ticketMapper.update(null, Wrappers.lambdaUpdate(TicketDO.class)
+                    .eq(TicketDO::getTrainId, Long.valueOf(trainId))
+                    .eq(TicketDO::getCarriageNumber, each.getCarriageNumber())
+                    .eq(TicketDO::getSeatNumber, each.getSeatNumber())
+                    .eq(TicketDO::getDeparture, departure)
+                    .eq(TicketDO::getArrival, arrival)
+                    .in(TicketDO::getTicketStatus,
+                            TicketStatusEnum.UNPAID.getCode(),
+                            TicketStatusEnum.PAID.getCode(),
+                            TicketStatusEnum.BOARDED.getCode())
+                    .set(TicketDO::getTicketStatus, TicketStatusEnum.CLOSED.getCode()));
+        }
+        // 2. 位图释放：pipeline 清位；失败只会"少卖"不会"超卖"，由对账任务兜底修复
         try {
-            List<String> stations = listStationOrdered(trainId);
+            List<String> stations = seatBitMapAssembler.listStationOrdered(trainId);
             int departureIdx = stations.indexOf(departure);
             int arrivalIdx = stations.indexOf(arrival);
             if (departureIdx < 0 || arrivalIdx <= departureIdx) {
                 return;
             }
             int stationCount = stations.size();
-            StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
+            Map<String, List<Long>> releaseBitOffsets = new LinkedHashMap<>();
             for (TrainPurchaseTicketRespDTO each : trainPurchaseTicketResults) {
                 if (!SeatBitMapUtil.supports(each.getSeatType())) {
                     continue;
@@ -310,13 +295,24 @@ public class SeatServiceImpl extends ServiceImpl<SeatMapper, SeatDO> implements 
                     continue;
                 }
                 String bitMapKey = SeatBitMapUtil.buildKey(trainId, each.getCarriageNumber());
+                List<Long> offsets = releaseBitOffsets.computeIfAbsent(bitMapKey, k -> new ArrayList<>());
                 for (int segmentIdx = departureIdx; segmentIdx < arrivalIdx; segmentIdx++) {
-                    long offset = SeatBitMapUtil.bitOffset(seatIndex, stationCount, segmentIdx);
-                    stringRedisTemplate.opsForValue().setBit(bitMapKey, offset, false);
+                    offsets.add(SeatBitMapUtil.bitOffset(seatIndex, stationCount, segmentIdx));
                 }
             }
+            if (releaseBitOffsets.isEmpty()) {
+                return;
+            }
+            StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
+            releaseBitOffsets.forEach((key, offsets) -> stringRedisTemplate.executePipelined((RedisCallback<Object>) connection -> {
+                byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+                for (Long offset : offsets) {
+                    connection.stringCommands().setBit(keyBytes, offset, false);
+                }
+                return null;
+            }));
         } catch (Throwable ex) {
-            log.error("[释放座位] 车次：{} 区间：{}→{} 清理座位占用位图失败，座位将保持占用状态直至位图重建", trainId, departure, arrival, ex);
+            log.error("[释放座位] 车次：{} 区间：{}→{} 清理座位占用位图失败，等待对账任务修复", trainId, departure, arrival, ex);
         }
     }
 
@@ -333,127 +329,26 @@ public class SeatServiceImpl extends ServiceImpl<SeatMapper, SeatDO> implements 
     }
 
     /**
-     * 车厢座位占用位图缺失时，由数据库 t_seat 全量重建：
-     * 先将布局内全部位置置 1（含非物理座位），再将数据库中 AVAILABLE 区段清 0
+     * 车厢座位占用位图缺失时，由"注册表 + 账本"全量组装后以 SET NX 一次原子写入。
+     * 无分布式锁：并发组装者各自构建完整位图，NX 保证仅首个写入者生效，其余丢弃，
+     * 消除了逐位 pipeline 写入的"半成品位图"风险与整列车锁粒度阻塞。
      */
     private void ensureSeatBitMapExists(String trainId, String carriageNumber, String bitMapKey) {
         if (distributedCache.hasKey(bitMapKey)) {
             return;
         }
-        RLock lock = redissonClient.getLock(String.format(LOCK_SEAT_BIT_MAP, trainId));
-        lock.lock();
-        try {
-            if (distributedCache.hasKey(bitMapKey)) {
-                return;
-            }
-            List<String> stations = listStationOrdered(trainId);
-            int stationCount = stations.size();
-            Integer seatType = lambdaQuery()
-                    .eq(SeatDO::getTrainId, Long.valueOf(trainId))
-                    .eq(SeatDO::getCarriageNumber, carriageNumber)
-                    .last("LIMIT 1")
-                    .oneOpt()
-                    .map(SeatDO::getSeatType)
-                    .orElse(null);
-            if (!SeatBitMapUtil.supports(seatType)) {
-                log.warn("[座位位图] 车次：{} 车厢：{} 席别不支持位图，跳过初始化", trainId, carriageNumber);
-                return;
-            }
-            int rows = SeatBitMapUtil.getRows(seatType);
-            List<SeatDO> seatDOList = lambdaQuery()
-                    .eq(SeatDO::getTrainId, Long.valueOf(trainId))
-                    .eq(SeatDO::getCarriageNumber, carriageNumber)
-                    .list();
-            StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
-            stringRedisTemplate.executePipelined((RedisCallback<Object>) connection -> {
-                var stringCommands = connection.stringCommands();
-                byte[] keyBytes = bitMapKey.getBytes(StandardCharsets.UTF_8);
-                // 布局内全部位置默认占用（含非物理座位与已售/已锁区段）
-                for (int seatIndex = 0; seatIndex < rows * 6; seatIndex++) {
-                    for (int segmentIdx = 0; segmentIdx < stationCount; segmentIdx++) {
-                        stringCommands.setBit(keyBytes, SeatBitMapUtil.bitOffset(seatIndex, stationCount, segmentIdx), true);
-                    }
-                }
-                // 站段占用按"任一覆盖组合行非 AVAILABLE 即占用"聚合：
-                // 同一座位的组合行可能存在部分售出的历史混合状态，逐 AVAILABLE 行清位会把实际占用的站段错误标成空闲
-                Map<Integer, Set<Integer>> occupiedSegmentsBySeat = new HashMap<>();
-                Set<Integer> seenSeatIndexes = new HashSet<>();
-                for (SeatDO each : seatDOList) {
-                    int seatIndex = SeatBitMapUtil.seatIndexOf(seatType, each.getSeatNumber());
-                    if (seatIndex >= 0) {
-                        seenSeatIndexes.add(seatIndex);
-                    }
-                    if (SeatStatusEnum.AVAILABLE.getCode().equals(each.getSeatStatus())) {
-                        continue;
-                    }
-                    int startIdx = stations.indexOf(each.getStartStation());
-                    int endIdx = stations.indexOf(each.getEndStation());
-                    if (seatIndex < 0 || startIdx < 0 || endIdx <= startIdx) {
-                        continue;
-                    }
-                    Set<Integer> occupied = occupiedSegmentsBySeat.computeIfAbsent(seatIndex, k -> new HashSet<>());
-                    for (int segmentIdx = startIdx; segmentIdx < endIdx; segmentIdx++) {
-                        occupied.add(segmentIdx);
-                    }
-                }
-                // 仅清"布局内物理位且 DB 存在座位行"的位：非物理位置（无该字母列）与布局有但
-                // DB 缺座位行的位置都保持占用——否则会被位图统计当作空闲座位虚增余票，
-                // 或被选座命中后在 DB 行校验处必然冲突
-                Set<Integer> clearableSeatIndexes = new HashSet<>();
-                for (int row = 1; row <= rows; row++) {
-                    for (char letter : SeatBitMapUtil.getLetters(seatType).toCharArray()) {
-                        int seatIndex = (row - 1) * 6 + "ABCDEF".indexOf(letter);
-                        if (seenSeatIndexes.contains(seatIndex)) {
-                            clearableSeatIndexes.add(seatIndex);
-                        }
-                    }
-                }
-                for (int seatIndex : clearableSeatIndexes) {
-                    Set<Integer> occupied = occupiedSegmentsBySeat.getOrDefault(seatIndex, Collections.emptySet());
-                    for (int segmentIdx = 0; segmentIdx < stationCount; segmentIdx++) {
-                        if (!occupied.contains(segmentIdx)) {
-                            stringCommands.setBit(keyBytes, SeatBitMapUtil.bitOffset(seatIndex, stationCount, segmentIdx), false);
-                        }
-                    }
-                }
-                return null;
-            });
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /**
-     * 清理座位占用位图（回滚锁座写入），按车厢分 Key 管道执行
-     */
-    private void clearSeatBitMap(Map<String, List<Long>> occupiedBitOffsets) {
-        if (occupiedBitOffsets == null || occupiedBitOffsets.isEmpty()) {
+        byte[] bitmap = seatBitMapAssembler.assemble(trainId, carriageNumber);
+        if (bitmap == null) {
+            log.warn("[座位位图] 车次：{} 车厢：{} 席别不支持位图或无座位数据，跳过初始化", trainId, carriageNumber);
             return;
         }
-        try {
-            StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
-            occupiedBitOffsets.forEach((key, offsets) -> stringRedisTemplate.executePipelined((RedisCallback<Object>) connection -> {
-                byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
-                for (Long offset : offsets) {
-                    connection.stringCommands().setBit(keyBytes, offset, false);
-                }
-                return null;
-            }));
-        } catch (Throwable ex) {
-            log.error("[锁座] 回滚座位占用位图失败，位图 Key：{}", occupiedBitOffsets.keySet(), ex);
+        StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
+        Boolean success = stringRedisTemplate.execute((RedisCallback<Boolean>) connection ->
+                connection.stringCommands().set(bitMapKey.getBytes(StandardCharsets.UTF_8), bitmap,
+                        Expiration.persistent(), SetOption.SET_IF_ABSENT));
+        if (!Boolean.TRUE.equals(success)) {
+            // 其他线程/实例已写入：以对方为准（双方数据源一致，仅快照时点差异，对账任务兜底）
+            log.debug("[座位位图] 车次：{} 车厢：{} 位图已被其他实例写入，跳过", trainId, carriageNumber);
         }
-    }
-
-    /**
-     * 列车沿途站点有序列表（按插入序即行程序），站名与 t_seat.start_station/end_station 同源
-     */
-    private List<String> listStationOrdered(String trainId) {
-        return trainStationMapper.selectList(Wrappers.lambdaQuery(TrainStationDO.class)
-                        .eq(TrainStationDO::getTrainId, Long.valueOf(trainId))
-                        .select(TrainStationDO::getDeparture)
-                        .orderByAsc(TrainStationDO::getId))
-                .stream()
-                .map(TrainStationDO::getDeparture)
-                .collect(Collectors.toList());
     }
 }

@@ -69,34 +69,44 @@ def seat_numbers():
         for ch in 'ABCDF':
             yield '%02d%s' % (row, ch)
 
+# 座位可用性按 t_ticket 售卖区间账本重叠语义统计（与 SeatMapper.xml 同一谓词）
+FREE_SEAT_SQL = ("SELECT COUNT(*) FROM t_seat s WHERE s.train_id=1 AND s.seat_type=2 AND s.del_flag=0 "
+                 "AND NOT EXISTS (SELECT 1 FROM t_ticket t WHERE t.train_id=s.train_id "
+                 "AND t.carriage_number=s.carriage_number AND t.seat_number=s.seat_number "
+                 "AND t.ticket_status IN (0,1,2) AND t.del_flag=0 "
+                 "AND t.departure < '杭州东' AND t.arrival > '北京南');")
+
 def setup_seats():
     mysql_sql(
         "DELETE FROM t_carriage WHERE train_id=1 AND carriage_number IN ('17','18','19');"
-        "DELETE FROM t_seat WHERE train_id=1 AND carriage_number IN ('17','18','19');")
+        "DELETE FROM t_seat WHERE train_id=1 AND carriage_number IN ('17','18','19');"
+        "DELETE FROM t_ticket WHERE passenger_id=0 AND ticket_status=1 AND username IS NULL;")
     mysql_sql(
         "INSERT INTO t_carriage (train_id,carriage_number,carriage_type,seat_count,create_time,update_time,del_flag) "
         "VALUES (1,'17',2,90,NOW(),NOW(),0),(1,'18',2,90,NOW(),NOW(),0),(1,'19',2,90,NOW(),NOW(),0);")
+    # t_seat 已是物理座位注册表（一座位一行），只插座位本体
     values = []
     for carriage in NEW_CARRIAGES:
         for seat in seat_numbers():
-            for (s, e, price) in PAIRS:
-                values.append("(1,'%s','%s',2,'%s','%s',%d,0,NOW(),NOW(),0)" % (carriage, seat, s, e, price))
+            values.append("(1,'%s','%s',2,NOW(),NOW(),0)" % (carriage, seat))
     chunk = 500
     for i in range(0, len(values), chunk):
-        mysql_sql("INSERT INTO t_seat (train_id,carriage_number,seat_number,seat_type,start_station,end_station,price,seat_status,create_time,update_time,del_flag) VALUES "
+        mysql_sql("INSERT INTO t_seat (train_id,carriage_number,seat_number,seat_type,create_time,update_time,del_flag) VALUES "
                   + ','.join(values[i:i + chunk]) + ";")
-    avail = mysql_sql(
-        "SELECT COUNT(*) FROM t_seat WHERE train_id=1 AND seat_type=2 "
-        "AND start_station='北京南' AND end_station='杭州东' AND seat_status=0;", fetch=True)[0][0]
+    avail = mysql_sql(FREE_SEAT_SQL, fetch=True)[0][0]
     lock_count = int(avail) - TARGET_SELLABLE
     if lock_count > 0:
+        # 用整程占用的"锁定票"账本记录扣减多余可售（模拟旧模型整座预锁）
+        first = mysql_sql("SELECT departure FROM t_train_station WHERE train_id=1 ORDER BY id ASC LIMIT 1;", fetch=True)[0][0]
+        last = mysql_sql("SELECT departure FROM t_train_station WHERE train_id=1 ORDER BY id DESC LIMIT 1;", fetch=True)[0][0]
         lock_seats = list(seat_numbers())[:lock_count]
-        seat_list = ','.join("'%s'" % s for s in lock_seats)
-        mysql_sql("UPDATE t_seat SET seat_status=1 WHERE train_id=1 AND seat_type=2 "
-                  "AND carriage_number='17' AND seat_number IN (%s);" % seat_list)
-    avail = mysql_sql(
-        "SELECT COUNT(*) FROM t_seat WHERE train_id=1 AND seat_type=2 "
-        "AND start_station='北京南' AND end_station='杭州东' AND seat_status=0;", fetch=True)[0][0]
+        lock_values = []
+        for seat in lock_seats:
+            lock_values.append("(1,'17','%s',0,1,'%s','%s',NOW(),NOW(),0)" % (seat, first, last))
+        for i in range(0, len(lock_values), 500):
+            mysql_sql("INSERT INTO t_ticket (train_id,carriage_number,seat_number,passenger_id,ticket_status,departure,arrival,create_time,update_time,del_flag) VALUES "
+                      + ','.join(lock_values[i:i + 500]) + ";")
+    avail = mysql_sql(FREE_SEAT_SQL, fetch=True)[0][0]
     r = RedisMini()
     stale = r.cmd('KEYS', 'index12306-ticket-service:train_carriage_seat_status:1_*'.encode()) \
            + r.cmd('KEYS', 'index12306-ticket-service:train_station_remaining_ticket:1_*'.encode()) \

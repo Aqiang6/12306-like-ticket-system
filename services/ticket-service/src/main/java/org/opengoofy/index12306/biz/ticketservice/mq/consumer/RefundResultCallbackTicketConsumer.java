@@ -119,7 +119,16 @@ public class RefundResultCallbackTicketConsumer implements RocketMQListener<Mess
             return;
         }
         String trainId = String.valueOf(orderDetail.getTrainId());
-        // 释放座位：DB 站段行恢复可售 + 清理座位占用位图
+        // 车票账本先流转为已退票（仅已支付状态可流转，天然幂等）：
+        // 必须先于 unlock 执行，否则 unlock 会把有效票作废为 CLOSED，覆盖退票状态
+        refundedDetails.forEach(each -> ticketMapper.update(null, Wrappers.lambdaUpdate(TicketDO.class)
+                .eq(TicketDO::getTrainId, Long.valueOf(trainId))
+                .eq(TicketDO::getCarriageNumber, each.getCarriageNumber())
+                .eq(TicketDO::getSeatNumber, each.getSeatNumber())
+                .eq(TicketDO::getUsername, each.getUsername())
+                .eq(TicketDO::getTicketStatus, TicketStatusEnum.PAID.getCode())
+                .set(TicketDO::getTicketStatus, TicketStatusEnum.REFUNDED.getCode())));
+        // 释放座位：清理座位占用位图（unlock 内的账本作废因已流转为 REFUNDED 而不再匹配）
         seatService.unlock(trainId, orderDetail.getDeparture(), orderDetail.getArrival(), refundSeatResults);
         // 回补余票缓存：按退票坐席数量沿覆盖站段回加
         if (!StrUtil.equals(environment.getProperty("ticket.availability.cache-update.type", ""), "binlog")) {
@@ -133,15 +142,7 @@ public class RefundResultCallbackTicketConsumer implements RocketMQListener<Mess
                         stringRedisTemplate.opsForHash().increment(TRAIN_STATION_REMAINING_TICKET + keySuffix, String.valueOf(seatType), count));
             });
         }
-        // 车票状态流转为已退票（仅已支付状态可流转，天然幂等）
-        refundedDetails.forEach(each -> ticketMapper.update(null, Wrappers.lambdaUpdate(TicketDO.class)
-                .eq(TicketDO::getTrainId, Long.valueOf(trainId))
-                .eq(TicketDO::getCarriageNumber, each.getCarriageNumber())
-                .eq(TicketDO::getSeatNumber, each.getSeatNumber())
-                .eq(TicketDO::getUsername, each.getUsername())
-                .eq(TicketDO::getTicketStatus, TicketStatusEnum.PAID.getCode())
-                .set(TicketDO::getTicketStatus, TicketStatusEnum.REFUNDED.getCode())));
-        log.info("[退票回调] 订单 {} 退票座位释放与余票缓存回补完成，共 {} 张", event.getOrderSn(), refundSeatResults.size());
+        log.info("[退票回调] 订单 {} 退票账本流转、座位释放与余票缓存回补完成，共 {} 张", event.getOrderSn(), refundSeatResults.size());
     }
 
 }

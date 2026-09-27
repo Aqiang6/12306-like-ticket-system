@@ -56,3 +56,12 @@ test-run/*.jtl
 test-run/*.csv
 test-run/*.log
 .verify_tmp/
+
+### 压测运行产物补充（报告/结果/令牌/本机启动脚本，均含本机路径或敏感信息） ###
+test-run/jmeter_report*/
+test-run/*.jtl
+test-run/loadtest_users.csv
+test-run/run_*.bat
+test-run/broker_*.bat
+test-run/start_broker.bat
+test-run/smoke_sn.txt

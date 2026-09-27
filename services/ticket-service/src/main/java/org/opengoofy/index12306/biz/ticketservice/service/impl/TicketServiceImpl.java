@@ -531,6 +531,9 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
             long stock = value == null ? 0L : Long.parseLong(value.toString());
             long need = (Long) seatTypeNeed.values().toArray()[i];
             if (stock < need) {
+                // 零点即时广播：排队到临界区才发现售罄时，立刻置位标志让仍在排队的等待线程快速退出
+                ticketStockDisplayRefresher.markSoldOut(trainId, requestParam.getDeparture(),
+                        requestParam.getArrival(), seatTypeNeed.keySet());
                 throw new ClientException("车票已售完，您可提交候补订单或选择其他车次");
             }
         }
@@ -541,7 +544,7 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
                 () -> trainMapper.selectById(trainId),
                 ADVANCE_TICKET_DAY,
                 TimeUnit.DAYS);
-        // 临界区仅保留：选座 + 锁座 + 车票落库（余票已在预占层扣减）；乘车人/票价补全与订单创建移至锁外
+        // 临界区仅保留：选座 + 锁座 + 车票落账本（余票已在预占层扣减）；乘车人/票价补全与订单创建移至锁外
         List<TrainPurchaseTicketRespDTO> trainPurchaseTicketResults = trainSeatTypeSelector.selectSeatsAndLock(trainDO.getTrainType(), requestParam);
         List<TicketDO> ticketDOList = trainPurchaseTicketResults.stream()
                 .map(each -> TicketDO.builder()
@@ -551,9 +554,18 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
                         .seatNumber(each.getSeatNumber())
                         .passengerId(each.getPassengerId())
                         .ticketStatus(TicketStatusEnum.UNPAID.getCode())
+                        .departure(requestParam.getDeparture())
+                        .arrival(requestParam.getArrival())
                         .build())
                 .toList();
-        saveBatch(ticketDOList);
+        try {
+            saveBatch(ticketDOList);
+        } catch (Throwable ex) {
+            // 账本落库失败：位图已置位而无票记录，事务回滚后立即释放位图，避免等对账修复期间少卖
+            log.error("[购票] 车票账本落库失败，补偿释放位图，车次：{}", trainId, ex);
+            seatService.unlock(trainId, requestParam.getDeparture(), requestParam.getArrival(), trainPurchaseTicketResults);
+            throw ex;
+        }
         return TicketPurchasePrepareDTO.builder()
                 .trainId(trainId)
                 .departure(requestParam.getDeparture())
@@ -945,6 +957,8 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
                                 .seatNumber(each.getSeatNumber())
                                 .passengerId(each.getPassengerId())
                                 .ticketStatus(TicketStatusEnum.UNPAID.getCode())
+                                .departure(newPurchaseReq.getDeparture())
+                                .arrival(newPurchaseReq.getArrival())
                                 .build())
                         .toList();
                 saveBatch(newTicketDOList);

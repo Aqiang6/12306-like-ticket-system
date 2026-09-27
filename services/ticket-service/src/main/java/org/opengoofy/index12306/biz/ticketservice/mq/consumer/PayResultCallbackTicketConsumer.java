@@ -24,11 +24,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.spring.annotation.RocketMQMessageListener;
 import org.apache.rocketmq.spring.core.RocketMQListener;
 import org.opengoofy.index12306.biz.ticketservice.common.constant.TicketRocketMQConstant;
-import org.opengoofy.index12306.biz.ticketservice.common.enums.SeatStatusEnum;
-import org.opengoofy.index12306.biz.ticketservice.dao.entity.SeatDO;
 import org.opengoofy.index12306.biz.ticketservice.common.enums.TicketStatusEnum;
 import org.opengoofy.index12306.biz.ticketservice.dao.entity.TicketDO;
-import org.opengoofy.index12306.biz.ticketservice.dao.mapper.SeatMapper;
 import org.opengoofy.index12306.biz.ticketservice.dao.mapper.TicketMapper;
 import org.opengoofy.index12306.biz.ticketservice.mq.domain.MessageWrapper;
 import org.opengoofy.index12306.biz.ticketservice.mq.event.PayResultCallbackTicketEvent;
@@ -60,7 +57,6 @@ import java.util.Objects;
 public class PayResultCallbackTicketConsumer implements RocketMQListener<MessageWrapper<PayResultCallbackTicketEvent>> {
 
     private final TicketOrderRemoteService ticketOrderRemoteService;
-    private final SeatMapper seatMapper;
     private final TicketMapper ticketMapper;
 
     @Idempotent(
@@ -85,17 +81,8 @@ public class PayResultCallbackTicketConsumer implements RocketMQListener<Message
         }
         TicketOrderDetailRespDTO ticketOrderDetail = ticketOrderDetailResult.getData();
         for (TicketOrderPassengerDetailRespDTO each : ticketOrderDetail.getPassengerDetails()) {
-            LambdaUpdateWrapper<SeatDO> updateWrapper = Wrappers.lambdaUpdate(SeatDO.class)
-                    .eq(SeatDO::getTrainId, ticketOrderDetail.getTrainId())
-                    .eq(SeatDO::getCarriageNumber, each.getCarriageNumber())
-                    .eq(SeatDO::getSeatNumber, each.getSeatNumber())
-                    .eq(SeatDO::getSeatType, each.getSeatType())
-                    .eq(SeatDO::getStartStation, ticketOrderDetail.getDeparture())
-                    .eq(SeatDO::getEndStation, ticketOrderDetail.getArrival());
-            SeatDO updateSeatDO = new SeatDO();
-            updateSeatDO.setSeatStatus(SeatStatusEnum.SOLD.getCode());
-            seatMapper.update(updateSeatDO, updateWrapper);
-            // 支付成功同步流转车票状态 UNPAID -> PAID，退票链路依赖该状态做 REFUNDED 流转
+            // 支付成功同步流转车票账本状态 UNPAID -> PAID（座位占用由位图与账本表达，注册表无状态流转）；
+            // 退票链路依赖该状态做 REFUNDED 流转
             ticketMapper.update(null, Wrappers.lambdaUpdate(TicketDO.class)
                     .eq(TicketDO::getTrainId, ticketOrderDetail.getTrainId())
                     .eq(TicketDO::getCarriageNumber, each.getCarriageNumber())

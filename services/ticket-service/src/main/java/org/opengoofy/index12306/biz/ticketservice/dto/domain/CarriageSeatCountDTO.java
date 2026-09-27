@@ -15,38 +15,19 @@
  * limitations under the License.
  */
 
-package org.opengoofy.index12306.biz.ticketservice.dao.entity;
+package org.opengoofy.index12306.biz.ticketservice.dto.domain;
 
-import com.baomidou.mybatisplus.annotation.TableName;
 import lombok.AllArgsConstructor;
-import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
-import org.opengoofy.index12306.framework.starter.database.base.BaseDO;
 
 /**
- * 座位实体（物理座位注册表：一座位一行，不含任何占用状态）
- *
- * <p>库存模型已重构：座位占用事实只存于两处——Redis 座位区间占用位图（热路径唯一准入）
- * 与 t_ticket 售卖区间账本（持久事实，departure/arrival 记录售卖区间）。
- * 本表仅描述"某车次某车厢存在哪些物理座位、什么席别"，用于位图重建与数据库兜底统计。
+ * 车厢可用座位数：指定区间内该车厢仍可售的座位数
  */
 @Data
-@TableName("t_seat")
 @NoArgsConstructor
 @AllArgsConstructor
-@Builder
-public class SeatDO extends BaseDO {
-
-    /**
-     * id
-     */
-    private Long id;
-
-    /**
-     * 列车id
-     */
-    private Long trainId;
+public class CarriageSeatCountDTO {
 
     /**
      * 车厢号
@@ -54,12 +35,7 @@ public class SeatDO extends BaseDO {
     private String carriageNumber;
 
     /**
-     * 座位号
+     * 可用座位数
      */
-    private String seatNumber;
-
-    /**
-     * 座位类型
-     */
-    private Integer seatType;
+    private Integer seatCount;
 }

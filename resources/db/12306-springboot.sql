@@ -34,16 +34,13 @@ CREATE TABLE `t_seat`
     `carriage_number` varchar(64) COLLATE utf8mb4_unicode_ci  DEFAULT NULL COMMENT '车厢号',
     `seat_number`     varchar(64) COLLATE utf8mb4_unicode_ci  DEFAULT NULL COMMENT '座位号',
     `seat_type`       int(3) DEFAULT NULL COMMENT '座位类型',
-    `start_station`   varchar(256) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '起始站',
-    `end_station`     varchar(256) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '终点站',
-    `price`           int(11) DEFAULT NULL COMMENT '车票价格',
-    `seat_status`     int(3) DEFAULT NULL COMMENT '座位状态',
     `create_time`     datetime                                DEFAULT NULL COMMENT '创建时间',
     `update_time`     datetime                                DEFAULT NULL COMMENT '修改时间',
     `del_flag`        tinyint(1) DEFAULT NULL COMMENT '删除标识',
     PRIMARY KEY (`id`),
-    KEY               `idx_train_id` (`train_id`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=1683022080920494081 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='座位表';
+    KEY               `idx_train_id_carriage` (`train_id`, `carriage_number`) USING BTREE,
+    KEY               `idx_train_id_seat_type` (`train_id`, `seat_type`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='座位表（物理座位注册表：一座位一行，占用状态由 Redis 位图与 t_ticket 售卖区间账本表达）';
 
 CREATE TABLE `t_station`
 (
@@ -68,11 +65,14 @@ CREATE TABLE `t_ticket`
     `seat_number`     varchar(64) COLLATE utf8mb4_unicode_ci  DEFAULT NULL COMMENT '座位号',
     `passenger_id`    bigint(20) DEFAULT NULL COMMENT '乘车人ID',
     `ticket_status`   int(3) DEFAULT NULL COMMENT '车票状态',
+    `departure`       varchar(64) COLLATE utf8mb4_unicode_ci  DEFAULT NULL COMMENT '出发站点（售卖区间起点）',
+    `arrival`         varchar(64) COLLATE utf8mb4_unicode_ci  DEFAULT NULL COMMENT '到达站点（售卖区间终点）',
     `create_time`     datetime                                DEFAULT NULL COMMENT '创建时间',
     `update_time`     datetime                                DEFAULT NULL COMMENT '修改时间',
     `del_flag`        tinyint(1) DEFAULT NULL COMMENT '删除标识',
-    PRIMARY KEY (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=1682790903965503489 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='车票表';
+    PRIMARY KEY (`id`),
+    KEY               `idx_train_carriage_seat` (`train_id`, `carriage_number`, `seat_number`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='车票表（本地售卖区间账本：有效状态票记录即座位区间占用事实）';
 
 CREATE TABLE `t_train`
 (

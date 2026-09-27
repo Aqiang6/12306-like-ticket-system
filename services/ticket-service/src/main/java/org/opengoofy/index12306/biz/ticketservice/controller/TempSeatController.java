@@ -21,10 +21,10 @@ import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import lombok.RequiredArgsConstructor;
-import org.opengoofy.index12306.biz.ticketservice.common.enums.SeatStatusEnum;
-import org.opengoofy.index12306.biz.ticketservice.dao.entity.SeatDO;
+import org.opengoofy.index12306.biz.ticketservice.common.enums.TicketStatusEnum;
+import org.opengoofy.index12306.biz.ticketservice.dao.entity.TicketDO;
 import org.opengoofy.index12306.biz.ticketservice.dao.entity.TrainStationRelationDO;
-import org.opengoofy.index12306.biz.ticketservice.dao.mapper.SeatMapper;
+import org.opengoofy.index12306.biz.ticketservice.dao.mapper.TicketMapper;
 import org.opengoofy.index12306.biz.ticketservice.dao.mapper.TrainStationRelationMapper;
 import org.opengoofy.index12306.framework.starter.cache.DistributedCache;
 import org.opengoofy.index12306.framework.starter.common.toolkit.ThreadUtil;
@@ -50,18 +50,22 @@ import static org.opengoofy.index12306.biz.ticketservice.common.constant.RedisKe
 @RequiredArgsConstructor
 public class TempSeatController {
 
-    private final SeatMapper seatMapper;
+    private final TicketMapper ticketMapper;
     private final TrainStationRelationMapper trainStationRelationMapper;
     private final DistributedCache distributedCache;
 
     /**
-     * 座位重置
+     * 座位重置：作废该车次全部有效票账本记录（座位占用随账本清空），失效余票缓存与占用位图
      */
     @PostMapping("/api/ticket-service/temp/seat/reset")
     public Result<Void> purchaseTickets(@RequestParam String trainId) {
-        SeatDO seatDO = new SeatDO();
-        seatDO.setSeatStatus(SeatStatusEnum.AVAILABLE.getCode());
-        seatMapper.update(seatDO, Wrappers.lambdaUpdate(SeatDO.class).eq(SeatDO::getTrainId, trainId));
+        ticketMapper.update(null, Wrappers.lambdaUpdate(TicketDO.class)
+                .eq(TicketDO::getTrainId, Long.valueOf(trainId))
+                .in(TicketDO::getTicketStatus,
+                        TicketStatusEnum.UNPAID.getCode(),
+                        TicketStatusEnum.PAID.getCode(),
+                        TicketStatusEnum.BOARDED.getCode())
+                .set(TicketDO::getTicketStatus, TicketStatusEnum.CLOSED.getCode()));
         ThreadUtil.sleep(5000);
         StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
         List<TrainStationRelationDO> trainStationRelationDOList = trainStationRelationMapper.selectList(Wrappers.lambdaQuery(TrainStationRelationDO.class)
@@ -70,7 +74,7 @@ public class TempSeatController {
             String keySuffix = StrUtil.join("_", each.getTrainId(), each.getDeparture(), each.getArrival());
             stringRedisTemplate.delete(TRAIN_STATION_REMAINING_TICKET + keySuffix);
         }
-        // 座位全部重置为可用后，失效车厢座位区间占用位图，下次查询由数据库重建
+        // 作废账本后，失效车厢座位区间占用位图，下次查询由注册表 + 账本重建为全空闲
         Set<String> seatBitMapKeys = stringRedisTemplate.keys(TRAIN_CARRIAGE_SEAT_STATUS + trainId + "_*");
         if (CollUtil.isNotEmpty(seatBitMapKeys)) {
             stringRedisTemplate.delete(seatBitMapKeys);

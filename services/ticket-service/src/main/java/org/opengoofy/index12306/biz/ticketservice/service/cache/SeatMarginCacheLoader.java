@@ -18,16 +18,13 @@
 package org.opengoofy.index12306.biz.ticketservice.service.cache;
 
 import cn.hutool.core.collection.CollUtil;
-import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import lombok.RequiredArgsConstructor;
-import org.opengoofy.index12306.biz.ticketservice.common.enums.SeatStatusEnum;
 import org.opengoofy.index12306.biz.ticketservice.common.enums.VehicleTypeEnum;
-import org.opengoofy.index12306.biz.ticketservice.dao.entity.SeatDO;
 import org.opengoofy.index12306.biz.ticketservice.dao.entity.TrainDO;
 import org.opengoofy.index12306.biz.ticketservice.dao.mapper.SeatMapper;
 import org.opengoofy.index12306.biz.ticketservice.dao.mapper.TrainMapper;
 import org.opengoofy.index12306.biz.ticketservice.dto.domain.RouteDTO;
+import org.opengoofy.index12306.biz.ticketservice.dto.domain.SeatTypeCountDTO;
 import org.opengoofy.index12306.biz.ticketservice.service.TrainStationService;
 import org.opengoofy.index12306.framework.starter.cache.DistributedCache;
 import org.opengoofy.index12306.framework.starter.cache.toolkit.CacheUtil;
@@ -36,9 +33,11 @@ import org.redisson.api.RedissonClient;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
@@ -130,14 +129,12 @@ public class SeatMarginCacheLoader {
     }
 
     private String selectSeatMargin(String trainId, Integer type, String departure, String arrival) {
-        LambdaQueryWrapper<SeatDO> queryWrapper = Wrappers.lambdaQuery(SeatDO.class)
-                .eq(SeatDO::getTrainId, trainId)
-                .eq(SeatDO::getSeatType, type)
-                .eq(SeatDO::getSeatStatus, SeatStatusEnum.AVAILABLE.getCode())
-                .eq(SeatDO::getStartStation, departure)
-                .eq(SeatDO::getEndStation, arrival);
-        return Optional.ofNullable(seatMapper.selectCount(queryWrapper))
-                .map(String::valueOf)
+        // 账本重叠语义：t_seat 为注册表，可用座位数 = 不与有效票区间重叠的注册座位数
+        List<SeatTypeCountDTO> countList = seatMapper.listSeatTypeCount(Long.valueOf(trainId), departure, arrival, Collections.singletonList(type));
+        return countList.stream()
+                .filter(each -> Objects.equals(each.getSeatType(), type))
+                .findAny()
+                .map(each -> String.valueOf(each.getSeatCount()))
                 .orElse("0");
     }
 }
