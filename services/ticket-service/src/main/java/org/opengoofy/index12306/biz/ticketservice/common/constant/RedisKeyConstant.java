@@ -74,11 +74,6 @@ public final class RedisKeyConstant {
     public static final String TRAIN_CARRIAGE = "index12306-ticket-service:train_carriage:";
 
     /**
-     * 车厢余票查询，Key Prefix + 列车ID_起始站点_终点
-     */
-    public static final String TRAIN_STATION_CARRIAGE_REMAINING_TICKET = "index12306-ticket-service:train_station_carriage_remaining_ticket:";
-
-    /**
      * 站点详细信息查询，Key Prefix + 列车ID_起始站点_终点
      */
     public static final String TRAIN_STATION_DETAIL = "index12306-ticket-service:train_station_detail:";
@@ -98,6 +93,13 @@ public final class RedisKeyConstant {
      * 每个座位占 站点数 个 bit：bit=1 表示该座位在对应相邻站段已售出占用，bit=0 表示空闲
      */
     public static final String TRAIN_CARRIAGE_SEAT_STATUS = "index12306-ticket-service:train_carriage_seat_status:";
+
+    /**
+     * 区间售罄广播，Key Prefix + 列车ID_出发站_到达站_席别：
+     * 余票展示层刷新为 0 → 置位（15s 自愈 TTL），恢复 > 0 → 清除；
+     * 购票路径在排队前与公平锁等待期间观测该标志，所需席别售完即逐出排队线程
+     */
+    public static final String TRAIN_INTERVAL_SOLD_OUT = "index12306-ticket-service:train_interval_sold_out:";
 
     /**
      * 车厢座位占用位图初始化分布式锁 Key

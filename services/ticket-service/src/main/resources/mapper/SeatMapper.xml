@@ -22,18 +22,23 @@
     <!--
       可用性判断统一按 t_ticket 售卖区间账本重叠语义：
       座位在 [departure, arrival) 可用 = 不存在任何有效票（UNPAID/PAID/BOARDED）与其区间重叠
-      有效票区间采用半开区间 [departure, arrival)，重叠条件：t.departure < arrival AND t.arrival > departure
+      站名不能按字典序比较。t_train_station 每行是一段相邻站区间，sequence 是车次内区间顺序；
+      两张票占用的区间重叠，当且仅当已售起始区间 <= 请求终止区间且已售终止区间 >= 请求起始区间。
     -->
     <sql id="seatFreeOnInterval">
         and not exists (
-            select 1 from t_ticket t
+            select straight_join 1 from t_ticket t
+            join t_train_station sold_start on sold_start.train_id = t.train_id
+                and sold_start.departure = t.departure and sold_start.del_flag = 0
+            join t_train_station sold_end on sold_end.train_id = t.train_id
+                and sold_end.arrival = t.arrival and sold_end.del_flag = 0
             where t.train_id = s.train_id
               and t.carriage_number = s.carriage_number
               and t.seat_number = s.seat_number
               and t.ticket_status in (0, 1, 2)
               and t.del_flag = 0
-              and t.departure &lt; #{arrival}
-              and t.arrival &gt; #{departure}
+              and cast(sold_start.sequence as unsigned) &lt;= cast(requested_end.sequence as unsigned)
+              and cast(sold_end.sequence as unsigned) &gt;= cast(requested_start.sequence as unsigned)
         )
     </sql>
 
@@ -41,6 +46,10 @@
     <select id="listCarriageSeatCount" resultType="org.opengoofy.index12306.biz.ticketservice.dto.domain.CarriageSeatCountDTO">
         select s.carriage_number as carriageNumber, count(*) as seatCount
         from t_seat s
+        join t_train_station requested_start on requested_start.train_id = s.train_id
+            and requested_start.departure = #{departure} and requested_start.del_flag = 0
+        join t_train_station requested_end on requested_end.train_id = s.train_id
+            and requested_end.arrival = #{arrival} and requested_end.del_flag = 0
         where s.train_id = #{trainId}
         and s.del_flag = 0
         and s.carriage_number in
@@ -54,6 +63,10 @@
     <select id="listSeatTypeCount" resultType="org.opengoofy.index12306.biz.ticketservice.dto.domain.SeatTypeCountDTO">
         select s.seat_type as seatType, count(*) as seatCount
         from t_seat s
+        join t_train_station requested_start on requested_start.train_id = s.train_id
+            and requested_start.departure = #{startStation} and requested_start.del_flag = 0
+        join t_train_station requested_end on requested_end.train_id = s.train_id
+            and requested_end.arrival = #{endStation} and requested_end.del_flag = 0
         where s.train_id = #{trainId}
         and s.del_flag = 0
         and s.seat_type in
@@ -61,28 +74,21 @@
             #{seatType}
         </foreach>
         and not exists (
-            select 1 from t_ticket t
+            select straight_join 1 from t_ticket t
+            join t_train_station sold_start on sold_start.train_id = t.train_id
+                and sold_start.departure = t.departure and sold_start.del_flag = 0
+            join t_train_station sold_end on sold_end.train_id = t.train_id
+                and sold_end.arrival = t.arrival and sold_end.del_flag = 0
             where t.train_id = s.train_id
               and t.carriage_number = s.carriage_number
               and t.seat_number = s.seat_number
               and t.ticket_status in (0, 1, 2)
               and t.del_flag = 0
-              and t.departure &lt; #{endStation}
-              and t.arrival &gt; #{startStation}
+              and cast(sold_start.sequence as unsigned) &lt;= cast(requested_end.sequence as unsigned)
+              and cast(sold_end.sequence as unsigned) &gt;= cast(requested_start.sequence as unsigned)
         )
         group by s.seat_type
         having seatCount &gt; 0
     </select>
 
-    <!-- 指定车厢区间可用座位号（位图缺失时的数据库兜底） -->
-    <select id="listAvailableSeatNumber" resultType="String">
-        select s.seat_number
-        from t_seat s
-        where s.train_id = #{trainId}
-        and s.carriage_number = #{carriageNumber}
-        and s.seat_type = #{seatType}
-        and s.del_flag = 0
-        <include refid="seatFreeOnInterval"/>
-        order by s.seat_number
-    </select>
 </mapper>

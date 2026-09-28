@@ -94,7 +94,7 @@ public class TicketListDTO {
     private Integer saleStatus;
 
     /**
-     * 列车标签集合 0：复兴号 1：智能动车组 2：静音车厢 3：支持选铺
+     * 列车标签集合 0：复兴号 1：智能动车组 2：静音车厢
      */
     private List<String> trainTags;
 

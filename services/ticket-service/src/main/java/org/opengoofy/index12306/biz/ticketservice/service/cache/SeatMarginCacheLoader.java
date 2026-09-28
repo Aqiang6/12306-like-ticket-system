@@ -77,39 +77,14 @@ public class SeatMarginCacheLoader {
                 );
                 List<RouteDTO> routeDTOList = trainStationService.listTrainStationRoute(trainId, trainDO.getStartStation(), trainDO.getEndStation());
                 if (CollUtil.isNotEmpty(routeDTOList)) {
-                    switch (trainDO.getTrainType()) {
-                        // TODO 通过已有列车类型座位枚举重构
-                        case 0 -> {
-                            for (RouteDTO each : routeDTOList) {
-                                Map<String, String> trainStationRemainingTicket = new LinkedHashMap<>();
-                                trainStationRemainingTicket.put("0", selectSeatMargin(trainId, 0, each.getStartStation(), each.getEndStation()));
-                                trainStationRemainingTicket.put("1", selectSeatMargin(trainId, 1, each.getStartStation(), each.getEndStation()));
-                                trainStationRemainingTicket.put("2", selectSeatMargin(trainId, 2, each.getStartStation(), each.getEndStation()));
-                                String actualKeySuffix = CacheUtil.buildKey(trainId, each.getStartStation(), each.getEndStation());
-                                trainStationRemainingTicketMaps.put(TRAIN_STATION_REMAINING_TICKET + actualKeySuffix, trainStationRemainingTicket);
-                            }
+                    for (RouteDTO each : routeDTOList) {
+                        Map<String, String> remaining = new LinkedHashMap<>();
+                        for (Integer type : VehicleTypeEnum.findSeatTypesByCode(trainDO.getTrainType())) {
+                            remaining.put(String.valueOf(type), selectSeatMargin(trainId, type, each.getStartStation(), each.getEndStation()));
                         }
-                        case 1 -> {
-                            for (RouteDTO each : routeDTOList) {
-                                Map<String, String> trainStationRemainingTicket = new LinkedHashMap<>();
-                                trainStationRemainingTicket.put("3", selectSeatMargin(trainId, 3, each.getStartStation(), each.getEndStation()));
-                                trainStationRemainingTicket.put("4", selectSeatMargin(trainId, 4, each.getStartStation(), each.getEndStation()));
-                                trainStationRemainingTicket.put("5", selectSeatMargin(trainId, 5, each.getStartStation(), each.getEndStation()));
-                                trainStationRemainingTicket.put("13", selectSeatMargin(trainId, 13, each.getStartStation(), each.getEndStation()));
-                                String actualKeySuffix = CacheUtil.buildKey(trainId, each.getStartStation(), each.getEndStation());
-                                trainStationRemainingTicketMaps.put(TRAIN_STATION_REMAINING_TICKET + actualKeySuffix, trainStationRemainingTicket);
-                            }
-                        }
-                        case 2 -> {
-                            for (RouteDTO each : routeDTOList) {
-                                Map<String, String> trainStationRemainingTicket = new LinkedHashMap<>();
-                                trainStationRemainingTicket.put("6", selectSeatMargin(trainId, 6, each.getStartStation(), each.getEndStation()));
-                                trainStationRemainingTicket.put("7", selectSeatMargin(trainId, 7, each.getStartStation(), each.getEndStation()));
-                                trainStationRemainingTicket.put("8", selectSeatMargin(trainId, 8, each.getStartStation(), each.getEndStation()));
-                                trainStationRemainingTicket.put("13", selectSeatMargin(trainId, 13, each.getStartStation(), each.getEndStation()));
-                                String actualKeySuffix = CacheUtil.buildKey(trainId, each.getStartStation(), each.getEndStation());
-                                trainStationRemainingTicketMaps.put(TRAIN_STATION_REMAINING_TICKET + actualKeySuffix, trainStationRemainingTicket);
-                            }
+                        if (!remaining.isEmpty()) {
+                            String actualKeySuffix = CacheUtil.buildKey(trainId, each.getStartStation(), each.getEndStation());
+                            trainStationRemainingTicketMaps.put(TRAIN_STATION_REMAINING_TICKET + actualKeySuffix, remaining);
                         }
                     }
                 } else {

@@ -96,4 +96,13 @@ public class PayDO extends BaseDO {
      * 支付状态
      */
     private Integer status;
+
+    /** 支付结果发件箱，与支付状态保存在同一行、同一分片。0 无消息，1 待发送，2 已发送。 */
+    private Integer notificationStatus;
+
+    /** 成功回调的不可变快照，后续退款不改变待发送的支付事件。 */
+    private String notificationPayload;
+
+    /** 下次发送时间，同时作为多实例发送认领的租期。 */
+    private Date notificationNextRetry;
 }

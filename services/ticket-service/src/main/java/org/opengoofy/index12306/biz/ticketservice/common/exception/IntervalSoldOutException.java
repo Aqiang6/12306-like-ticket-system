@@ -15,24 +15,17 @@
  * limitations under the License.
  */
 
-package org.opengoofy.index12306.biz.ticketservice.service.handler.ticket;
+package org.opengoofy.index12306.biz.ticketservice.common.exception;
 
-import org.opengoofy.index12306.biz.ticketservice.common.enums.VehicleSeatTypeEnum;
-import org.opengoofy.index12306.biz.ticketservice.service.SeatService;
-import org.springframework.stereotype.Component;
+import org.opengoofy.index12306.framework.starter.convention.exception.ServiceException;
 
 /**
- * 普速列车硬座选座策略
+ * 区间售罄广播逐出异常：购票排队前/排队中观测到所需席别在当前区间的展示余票被刷新为 0。
+ * 属预期业务拒绝（快手段），调用方据此与真实临界区故障区分开做降噪记录。
  */
-@Component
-public class TrainHardSeatPurchaseTicketHandler extends AbstractRegularTrainPurchaseTicketHandler {
+public class IntervalSoldOutException extends ServiceException {
 
-    public TrainHardSeatPurchaseTicketHandler(SeatService seatService) {
-        super(seatService);
-    }
-
-    @Override
-    protected VehicleSeatTypeEnum seatType() {
-        return VehicleSeatTypeEnum.HARD_SEAT;
+    public IntervalSoldOutException(String message) {
+        super(message);
     }
 }

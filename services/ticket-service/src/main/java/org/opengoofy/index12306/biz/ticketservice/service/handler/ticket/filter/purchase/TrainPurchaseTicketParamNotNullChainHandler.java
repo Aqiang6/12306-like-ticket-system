@@ -25,6 +25,7 @@ import org.opengoofy.index12306.framework.starter.convention.exception.ClientExc
 import org.springframework.stereotype.Component;
 
 import java.util.Objects;
+import org.opengoofy.index12306.biz.ticketservice.toolkit.SeatBitMapUtil;
 
 /**
  * 购票流程过滤器之验证参数必填
@@ -53,6 +54,9 @@ public class TrainPurchaseTicketParamNotNullChainHandler implements TrainPurchas
             }
             if (Objects.isNull(each.getSeatType())) {
                 throw new ClientException("座位类型不能为空");
+            }
+            if (!SeatBitMapUtil.supports(each.getSeatType())) {
+                throw new ClientException("仅支持商务座、一等座和二等座");
             }
         }
     }

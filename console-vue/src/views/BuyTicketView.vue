@@ -27,7 +27,6 @@
           <span class="seat-qty">{{ item.quantity >= 1 ? '有票' : `${item.quantity} 张票` }}</span>
         </div>
       </div>
-      <p class="brief-tip">*显示的卧铺票价均为上铺票价，供您参考，具体票价以您确认支付时实际购买的铺别票价为准。</p>
     </div>
 
     <!-- 乘客信息 -->

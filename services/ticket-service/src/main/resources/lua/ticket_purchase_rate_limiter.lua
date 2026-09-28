@@ -1,39 +1,36 @@
--- 购票限流令牌桶（经典限流语义：按速率补充令牌，突发容量上限）
--- 与余票库存无关：令牌只在余票充足期间控制进入选座临界区的速率，防超卖由锁内位图 + DB 保证
--- KEYS[1] 令牌桶 key
--- ARGV[1] 桶容量（突发上限）
--- ARGV[2] 每秒补充令牌数（持续准入吞吐）
--- ARGV[3] 本次请求消耗令牌数
--- ARGV[4] 当前毫秒时间戳（应用侧传入，规避低版本 Redis Lua 不支持 TIME 命令的问题）
-local key = KEYS[1]
-local capacity = tonumber(ARGV[1])
+-- All requested interval/seat-type buckets are consumed atomically.
+-- KEYS[i] bucket; ARGV[1] current time (ms); ARGV[2] refill per second;
+-- ARGV[3 + (i-1)*2] capacity; the following argument is requested tokens.
+local now = tonumber(ARGV[1])
 local refillRate = tonumber(ARGV[2])
-local requested = tonumber(ARGV[3])
-local now = tonumber(ARGV[4])
+local buckets = {}
+local allowed = 1
 
-local bucket = redis.call('HMGET', key, 'tokens', 'last_refill_ms')
-local tokens = tonumber(bucket[1])
-local lastRefillMs = tonumber(bucket[2])
-
-if tokens == nil or lastRefillMs == nil then
-    tokens = capacity
-    lastRefillMs = now
-else
-    local deltaMs = now - lastRefillMs
-    if deltaMs > 0 then
-        tokens = math.min(capacity, tokens + deltaMs / 1000 * refillRate)
+for i, key in ipairs(KEYS) do
+    local capacity = tonumber(ARGV[3 + (i - 1) * 2])
+    local requested = tonumber(ARGV[4 + (i - 1) * 2])
+    local previous = redis.call('HMGET', key, 'tokens', 'last_refill_ms')
+    local tokens = tonumber(previous[1])
+    local lastRefillMs = tonumber(previous[2])
+    if tokens == nil or lastRefillMs == nil then
+        tokens = capacity
+    elseif now > lastRefillMs then
+        tokens = math.min(capacity, tokens + (now - lastRefillMs) / 1000 * refillRate)
     end
+    if tokens < requested then
+        allowed = 0
+    end
+    buckets[i] = {key = key, capacity = capacity, requested = requested, tokens = tokens}
 end
 
-local allowed = 0
-if tokens >= requested then
-    tokens = tokens - requested
-    allowed = 1
+for _, bucket in ipairs(buckets) do
+    local tokens = bucket.tokens
+    if allowed == 1 then
+        tokens = tokens - bucket.requested
+    end
+    redis.call('HMSET', bucket.key, 'tokens', tokens, 'last_refill_ms', now)
+    local ttlMs = math.max(60000, math.ceil(bucket.capacity / refillRate * 2 * 1000))
+    redis.call('PEXPIRE', bucket.key, ttlMs)
 end
-
-redis.call('HMSET', key, 'tokens', tokens, 'last_refill_ms', now)
--- 空闲过期：按当前速率补满整桶所需时间的 2 倍，最低保底 60 秒
-local ttlMs = math.max(60000, math.ceil(capacity / refillRate * 2 * 1000))
-redis.call('PEXPIRE', key, ttlMs)
 
 return allowed

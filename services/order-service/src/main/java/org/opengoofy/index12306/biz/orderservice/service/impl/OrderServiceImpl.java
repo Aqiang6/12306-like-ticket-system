@@ -370,41 +370,32 @@ public class OrderServiceImpl implements OrderService {
     }
 
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public void statusReversal(OrderStatusReversalDTO requestParam) {
-        LambdaQueryWrapper<OrderDO> queryWrapper = Wrappers.lambdaQuery(OrderDO.class)
-                .eq(OrderDO::getOrderSn, requestParam.getOrderSn());
-        OrderDO orderDO = orderMapper.selectOne(queryWrapper);
-        if (orderDO == null) {
+        // 行锁覆盖消费者的整个事务，重复投递只确认已完成状态，不回退退款/完成状态。
+        OrderDO order = orderMapper.selectOne(Wrappers.lambdaQuery(OrderDO.class)
+                .eq(OrderDO::getOrderSn, requestParam.getOrderSn()).last("FOR UPDATE"));
+        if (order == null) {
             throw new ServiceException(OrderCanalErrorCodeEnum.ORDER_CANAL_UNKNOWN_ERROR);
-        } else if (orderDO.getStatus() != OrderStatusEnum.PENDING_PAYMENT.getStatus()) {
+        }
+        if (Objects.equals(requestParam.getOrderStatus(), OrderStatusEnum.ALREADY_PAID.getStatus())
+                && List.of(OrderStatusEnum.ALREADY_PAID.getStatus(), OrderStatusEnum.PARTIAL_REFUND.getStatus(),
+                        OrderStatusEnum.FULL_REFUND.getStatus(), OrderStatusEnum.COMPLETED.getStatus()).contains(order.getStatus())) {
+            return;
+        }
+        if (!Objects.equals(order.getStatus(), OrderStatusEnum.PENDING_PAYMENT.getStatus())) {
             throw new ServiceException(OrderCanalErrorCodeEnum.ORDER_CANAL_STATUS_ERROR);
         }
-        RLock lock = redissonClient.getLock(StrBuilder.create("order:status-reversal:order_sn_").append(requestParam.getOrderSn()).toString());
-        boolean locked = lock.tryLock();
-        if (!locked) {
-            log.warn("订单重复修改状态，状态反转请求参数：{}", JSON.toJSONString(requestParam));
-        }
-        try {
-            OrderDO updateOrderDO = new OrderDO();
-            updateOrderDO.setStatus(requestParam.getOrderStatus());
-            LambdaUpdateWrapper<OrderDO> updateWrapper = Wrappers.lambdaUpdate(OrderDO.class)
-                    .eq(OrderDO::getOrderSn, requestParam.getOrderSn());
-            int updateResult = orderMapper.update(updateOrderDO, updateWrapper);
-            if (updateResult <= 0) {
-                throw new ServiceException(OrderCanalErrorCodeEnum.ORDER_STATUS_REVERSAL_ERROR);
-            }
-            OrderItemDO orderItemDO = new OrderItemDO();
-            orderItemDO.setStatus(requestParam.getOrderItemStatus());
-            LambdaUpdateWrapper<OrderItemDO> orderItemUpdateWrapper = Wrappers.lambdaUpdate(OrderItemDO.class)
-                    .eq(OrderItemDO::getOrderSn, requestParam.getOrderSn());
-            int orderItemUpdateResult = orderItemMapper.update(orderItemDO, orderItemUpdateWrapper);
-            if (orderItemUpdateResult <= 0) {
-                throw new ServiceException(OrderCanalErrorCodeEnum.ORDER_STATUS_REVERSAL_ERROR);
-            }
-        } finally {
-            if (locked) {
-                lock.unlock();
-            }
+        int updated = orderMapper.update(null, Wrappers.lambdaUpdate(OrderDO.class)
+                .eq(OrderDO::getOrderSn, requestParam.getOrderSn())
+                .eq(OrderDO::getStatus, OrderStatusEnum.PENDING_PAYMENT.getStatus())
+                .set(OrderDO::getStatus, requestParam.getOrderStatus()));
+        int itemsUpdated = orderItemMapper.update(null, Wrappers.lambdaUpdate(OrderItemDO.class)
+                .eq(OrderItemDO::getOrderSn, requestParam.getOrderSn())
+                .eq(OrderItemDO::getStatus, OrderItemStatusEnum.PENDING_PAYMENT.getStatus())
+                .set(OrderItemDO::getStatus, requestParam.getOrderItemStatus()));
+        if (updated <= 0 || itemsUpdated <= 0) {
+            throw new ServiceException(OrderCanalErrorCodeEnum.ORDER_STATUS_REVERSAL_ERROR);
         }
     }
 

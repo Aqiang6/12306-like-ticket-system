@@ -74,7 +74,7 @@ CREATE TABLE `t_ticket`
     `update_time`     datetime                                DEFAULT NULL COMMENT '修改时间',
     `del_flag`        tinyint(1) DEFAULT NULL COMMENT '删除标识',
     PRIMARY KEY (`id`),
-    KEY               `idx_train_carriage_seat` (`train_id`, `carriage_number`, `seat_number`) USING BTREE
+    KEY               `idx_train_carriage_seat` (`train_id`, `carriage_number`, `seat_number`, `ticket_status`, `del_flag`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='车票表（本地售卖区间账本：有效状态票记录即座位区间占用事实）';
 
 CREATE TABLE `t_train`
@@ -82,7 +82,7 @@ CREATE TABLE `t_train`
     `id`             bigint(20) unsigned NOT NULL AUTO_INCREMENT COMMENT 'ID',
     `train_number`   varchar(256) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '列车车次',
     `train_type`     int(3) DEFAULT NULL COMMENT '列车类型 0：高铁 1：动车 2：普通车',
-    `train_tag`      varchar(32) COLLATE utf8mb4_unicode_ci  DEFAULT NULL COMMENT '列车标签 0：复兴号 1：智能动车组 2：静音车厢 3：支持选铺',
+    `train_tag`      varchar(32) COLLATE utf8mb4_unicode_ci  DEFAULT NULL COMMENT '列车标签 0：复兴号 1：智能动车组 2：静音车厢',
     `train_brand`    varchar(32) COLLATE utf8mb4_unicode_ci  DEFAULT NULL COMMENT '列车品牌 0：GC-高铁/城际 1：D-动车 2：Z-直达 3：T-特快 4：K-快速 5：其他 6：复兴号 7：智能动车组',
     `start_station`  varchar(256) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '起始站',
     `end_station`    varchar(256) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '终点站',

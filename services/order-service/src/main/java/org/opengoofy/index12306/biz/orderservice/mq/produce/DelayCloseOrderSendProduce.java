@@ -55,8 +55,8 @@ public class DelayCloseOrderSendProduce extends AbstractCommonSendProduceTemplat
                 .topic(environment.resolvePlaceholders(OrderRocketMQConstant.ORDER_DELAY_CLOSE_TOPIC_KEY))
                 .tag(environment.resolvePlaceholders(OrderRocketMQConstant.ORDER_DELAY_CLOSE_TAG_KEY))
                 .sentTimeout(2000L)
-                // RocketMQ 延迟消息级别 1s 5s 10s 30s 1m 2m 3m 4m 5m 6m 7m 8m 9m 10m 20m 30m 1h 2h；压测场景关单延迟调为 1m（级别 5）
-                .delayLevel(5)
+                // 待支付订单保留 20 分钟，避免短时高并发测试期间提前回收并重复出售同一张票。
+                .delayLevel(16)
                 .build();
     }
 

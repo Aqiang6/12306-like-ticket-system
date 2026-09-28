@@ -122,6 +122,10 @@ public final class TrainSeatTypeSelector {
 
     private List<TrainPurchaseTicketRespDTO> distributeAllSeats(Integer trainType, PurchaseTicketReqDTO requestParam) {
         List<PurchaseTicketPassengerDetailDTO> passengerDetails = requestParam.getPassengers();
+        if (!Objects.equals(trainType, VehicleTypeEnum.HIGH_SPEED_RAIN.getCode())
+                || passengerDetails.stream().anyMatch(each -> !org.opengoofy.index12306.biz.ticketservice.toolkit.SeatBitMapUtil.supports(each.getSeatType()))) {
+            throw new ServiceException("仅支持商务座、一等座和二等座");
+        }
         Map<Integer, List<PurchaseTicketPassengerDetailDTO>> seatTypeMap = passengerDetails.stream()
                 .collect(Collectors.groupingBy(PurchaseTicketPassengerDetailDTO::getSeatType));
         List<TrainPurchaseTicketRespDTO> actualResult = Collections.synchronizedList(new ArrayList<>(seatTypeMap.size()));

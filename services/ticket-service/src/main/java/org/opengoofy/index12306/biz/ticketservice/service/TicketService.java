@@ -39,15 +39,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 public interface TicketService extends IService<TicketDO> {
 
     /**
-     * 根据条件分页查询车票
-     *
-     * @param requestParam 分页查询车票请求参数
-     * @return 查询车票返回结果
-     */
-    TicketPageQueryRespDTO pageListTicketQueryV1(TicketPageQueryReqDTO requestParam);
-
-    /**
-     * 根据条件分页查询车票V2高性能版本
+     * 根据条件分页查询车票（唯一查询路径：余票读 3s 周期重写的展示缓存，缺失回源账本统计）
      *
      * @param requestParam 分页查询车票请求参数
      * @return 查询车票返回结果

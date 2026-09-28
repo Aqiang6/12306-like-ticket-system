@@ -17,7 +17,7 @@ rules:
   - !SHARDING
     tables:
       t_pay:
-        actualDataNodes: ds_${0..1}.t_pay_${0..31}
+        actualDataNodes: ds_0.t_pay_${0..15},ds_1.t_pay_${16..31}
         databaseStrategy:
           complex:
             shardingColumns: order_sn,pay_sn

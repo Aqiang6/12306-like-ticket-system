@@ -105,7 +105,7 @@ public class RefundServiceImpl implements RefundService {
         payDO.setStatus(result.getStatus());
         LambdaUpdateWrapper<PayDO> updateWrapper = Wrappers.lambdaUpdate(PayDO.class)
                 .eq(PayDO::getOrderSn, requestParam.getOrderSn());
-        int updateResult = payMapper.update(payDO, updateWrapper);
+        int updateResult = payMapper.update(null, updateWrapper.set(PayDO::getStatus, payDO.getStatus()));
         if (updateResult <= 0) {
             log.error("修改支付单退款结果失败，支付单信息：{}", JSON.toJSONString(payDO));
             throw new ServiceException("修改支付单退款结果失败");

@@ -25,13 +25,9 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.opengoofy.index12306.biz.ticketservice.common.constant.RedisKeyConstant;
-import org.opengoofy.index12306.biz.ticketservice.dao.entity.SeatDO;
-import org.opengoofy.index12306.biz.ticketservice.dao.entity.TrainStationDO;
 import org.opengoofy.index12306.biz.ticketservice.dao.entity.CarriageDO;
 import org.opengoofy.index12306.biz.ticketservice.dao.mapper.CarriageMapper;
-import org.opengoofy.index12306.biz.ticketservice.dao.mapper.SeatMapper;
-import org.opengoofy.index12306.biz.ticketservice.dao.mapper.TrainStationMapper;
-import org.opengoofy.index12306.biz.ticketservice.dto.domain.SeatTypeCountDTO;
+import org.opengoofy.index12306.biz.ticketservice.toolkit.SeatBitMapAssembler;
 import org.opengoofy.index12306.biz.ticketservice.toolkit.SeatBitMapUtil;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
@@ -41,10 +37,8 @@ import jakarta.annotation.PreDestroy;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -54,7 +48,6 @@ import java.util.stream.Collectors;
  * 余票缓存刷新器：余票缓存为只读展示层（"按钮亮不亮"），不做准入计数（准入由令牌桶负责）。
  * 周期（默认 3 秒）从座位占用位图 pipeline 拉取位图、本地聚合出各站段组合 × 坐席的可售数，
  * 周期性重写余票缓存（TRAIN_STATION_REMAINING_TICKET）；令牌桶容量与首页余票均读该缓存。
- * 不支持位图的坐席（卧铺等）回退数据库统计刷新，并降低刷新频率。
  */
 @Slf4j
 @Component
@@ -63,11 +56,18 @@ public class TicketStockDisplayRefresher {
 
     private static final String DISPLAY_KEY = RedisKeyConstant.TRAIN_STATION_REMAINING_TICKET;
     private static final String BITMAP_KEY = RedisKeyConstant.TRAIN_CARRIAGE_SEAT_STATUS;
+    private static final String SOLD_OUT_KEY = RedisKeyConstant.TRAIN_INTERVAL_SOLD_OUT;
+
+    /**
+     * 售罄广播自愈 TTL：刷新器每 3s 续期，车次退出活跃集后标志最多残留 15s
+     */
+    private static final long SOLD_OUT_TTL_SECONDS = 15L;
+
+    private static final byte[] SOLD_OUT_VALUE = "1".getBytes(java.nio.charset.StandardCharsets.UTF_8);
 
     private final StringRedisTemplate stringRedisTemplate;
     private final CarriageMapper carriageMapper;
-    private final TrainStationMapper trainStationMapper;
-    private final SeatMapper seatMapper;
+    private final SeatBitMapAssembler seatBitMapAssembler;
     private final org.opengoofy.index12306.biz.ticketservice.service.SeatService seatService;
 
     /**
@@ -94,30 +94,6 @@ public class TicketStockDisplayRefresher {
             .maximumSize(4096)
             .build();
 
-    /**
-     * 不支持位图的车次：走数据库统计兜底，刷新降频（约 4 倍周期）
-     */
-    private final Cache<String, Boolean> dbFallbackTrains = Caffeine.newBuilder()
-            .expireAfterWrite(30, TimeUnit.MINUTES)
-            .maximumSize(4096)
-            .build();
-
-    private final Map<String, Long> dbFallbackLastRun = new HashMap<>();
-
-    /**
-     * 售罄广播标志：Key = 车次_出发_到达_席别，由刷新周期写入（余票为 0 → true，恢复 > 0 → 清除）。
-     * 购票等待线程以 200ms 分片 tryLock 轮询该标志，售罄即退出队列，不再空等锁位。
-     */
-    private final Map<String, Boolean> soldOutFlags = new java.util.concurrent.ConcurrentHashMap<>();
-
-    /**
-     * 售罄恢复计数：标志清除采用粘滞窗口——余票恢复 > 0 需连续 RECOVER_CYCLES 个刷新周期才清除标志，
-     * 防止自动关单回补座位导致余票在 0 与正数间抖动、等待线程永远观察不到售罄而拖到超时上限
-     */
-    private final Map<String, Integer> soldOutRecoverCounters = new java.util.concurrent.ConcurrentHashMap<>();
-
-    private static final int SOLD_OUT_RECOVER_CYCLES = 2;
-
     private ScheduledExecutorService scheduler;
 
     @PostConstruct
@@ -139,52 +115,6 @@ public class TicketStockDisplayRefresher {
     }
 
     /**
-     * 售罄广播查询：任一所需坐席在对应区间售罄即返回 true（标志由刷新周期维护，最长 3s 延迟）
-     */
-    public boolean isSoldOut(String trainId, String departure, String arrival, java.util.Set<Integer> seatTypes) {
-        for (Integer seatType : seatTypes) {
-            if (Boolean.TRUE.equals(soldOutFlags.get(trainId + "_" + departure + "_" + arrival + "_" + seatType))) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * 零点即时广播：购票链路观测到余票不足时同步置位售罄标志，
-     * 无需等待刷新器下一个 3s 周期，等待线程最迟 200ms 内退出队列
-     */
-    public void markSoldOut(String trainId, String departure, String arrival, java.util.Collection<Integer> seatTypes) {
-        for (Integer seatType : seatTypes) {
-            String key = trainId + "_" + departure + "_" + arrival + "_" + seatType;
-            soldOutFlags.put(key, Boolean.TRUE);
-            soldOutRecoverCounters.remove(key);
-        }
-    }
-
-    private void updateSoldOutFlags(String trainId, List<String> stations, Map<Integer, int[]> countsBySeatType) {
-        int comboIdx = 0;
-        for (int dep = 0; dep < stations.size() - 1; dep++) {
-            for (int arr = dep + 1; arr < stations.size(); arr++) {
-                String comboKey = trainId + "_" + stations.get(dep) + "_" + stations.get(arr) + "_";
-                for (Map.Entry<Integer, int[]> entry : countsBySeatType.entrySet()) {
-                    String flagKey = comboKey + entry.getKey();
-                    if (entry.getValue()[comboIdx] <= 0) {
-                        soldOutFlags.put(flagKey, Boolean.TRUE);
-                        soldOutRecoverCounters.remove(flagKey);
-                    } else if (soldOutFlags.containsKey(flagKey)
-                            && soldOutRecoverCounters.merge(flagKey, 1, Integer::sum) >= SOLD_OUT_RECOVER_CYCLES) {
-                        // 粘滞窗口：余票连续多个周期 > 0 才认定恢复，避免关单回补导致的标志抖动
-                        soldOutFlags.remove(flagKey);
-                        soldOutRecoverCounters.remove(flagKey);
-                    }
-                }
-                comboIdx++;
-            }
-        }
-    }
-
-    /**
      * 登记活跃车次：首页查询与购票入口调用，命中过的车次才会被周期刷新
      */
     public void touch(String trainId) {
@@ -200,6 +130,25 @@ public class TicketStockDisplayRefresher {
         return activeTrains.asMap().keySet();
     }
 
+    /**
+     * 区间售罄广播查询：任一所需席别在 车次×区间 的展示余票被刷新为 0 即返回 true。
+     * 标志由刷新周期维护（余票为 0 → 置位并续期；恢复 > 0 → 清除），座位位图仍是可售性的最终裁决。
+     */
+    public boolean anySoldOut(String trainId, String departure, String arrival, java.util.Collection<Integer> seatTypes) {
+        if (CollUtil.isEmpty(seatTypes)) {
+            return false;
+        }
+        List<String> keys = seatTypes.stream()
+                .map(seatType -> soldOutKey(trainId, departure, arrival, seatType))
+                .collect(Collectors.toList());
+        List<String> values = stringRedisTemplate.opsForValue().multiGet(keys);
+        return values != null && values.stream().anyMatch(java.util.Objects::nonNull);
+    }
+
+    private String soldOutKey(String trainId, String departure, String arrival, Integer seatType) {
+        return SOLD_OUT_KEY + trainId + "_" + departure + "_" + arrival + "_" + seatType;
+    }
+
     private void refreshAll() {
         try {
             String[] trains = activeTrains.asMap().keySet().toArray(new String[0]);
@@ -208,11 +157,7 @@ public class TicketStockDisplayRefresher {
             }
             for (String trainId : trains) {
                 try {
-                    if (Boolean.TRUE.equals(dbFallbackTrains.getIfPresent(trainId))) {
-                        refreshDbFallbackTrain(trainId);
-                    } else {
-                        refreshBitmapTrain(trainId);
-                    }
+                    refreshBitmapTrain(trainId);
                 } catch (Throwable ex) {
                     log.warn("余票展示层刷新失败，车次：{}", trainId, ex);
                 }
@@ -224,18 +169,13 @@ public class TicketStockDisplayRefresher {
 
     private void refreshBitmapTrain(String trainId) {
         List<CarriageDO> carriages = carriageCache.get(trainId,
-                k -> carriageMapper.selectList(Wrappers.lambdaQuery(CarriageDO.class).eq(CarriageDO::getTrainId, Long.valueOf(trainId))));
+                k -> carriageMapper.selectList(Wrappers.lambdaQuery(CarriageDO.class).eq(CarriageDO::getTrainId, Long.valueOf(trainId))
+                        .in(CarriageDO::getCarriageType, 0, 1, 2)));
         if (CollUtil.isEmpty(carriages)) {
             log.warn("余票展示层刷新跳过：车次 {} 无车厢数据", trainId);
             return;
         }
-        // 存在不支持位图的坐席（卧铺等）：该车次转入数据库兜底通道
-        if (carriages.stream().anyMatch(each -> !SeatBitMapUtil.supports(each.getCarriageType()))) {
-            dbFallbackTrains.put(trainId, Boolean.TRUE);
-            refreshDbFallbackTrain(trainId);
-            return;
-        }
-        List<String> stations = stationCache.get(trainId, k -> listStationOrdered(trainId));
+        List<String> stations = stationCache.get(trainId, seatBitMapAssembler::listStationOrdered);
         if (CollUtil.isEmpty(stations) || stations.size() < 2) {
             log.warn("余票展示层刷新跳过：车次 {} 站点数据不足", trainId);
             return;
@@ -299,11 +239,12 @@ public class TicketStockDisplayRefresher {
             }
         }
         // 写展示缓存：每个站段组合一个 Hash，field = 坐席类型
-        writeDisplayKeys(trainId, stations, countsBySeatType, false);
+        writeDisplayKeys(trainId, stations, countsBySeatType);
     }
 
-    private void writeDisplayKeys(String trainId, List<String> stations, Map<Integer, int[]> countsBySeatType, boolean suppressLog) {
-        updateSoldOutFlags(trainId, stations, countsBySeatType);
+    private void writeDisplayKeys(String trainId, List<String> stations, Map<Integer, int[]> countsBySeatType) {
+        List<byte[]> soldOutKeys = new ArrayList<>();
+        List<byte[]> restoredKeys = new ArrayList<>();
         stringRedisTemplate.executePipelined((org.springframework.data.redis.core.RedisCallback<Object>) connection -> {
             int comboIdx = 0;
             for (int dep = 0; dep < stations.size() - 1; dep++) {
@@ -314,72 +255,34 @@ public class TicketStockDisplayRefresher {
                         int count = entry.getValue()[comboIdx];
                         connection.hashCommands().hSet(keyBytes, String.valueOf(entry.getKey()).getBytes(StandardCharsets.UTF_8),
                                 String.valueOf(count).getBytes(StandardCharsets.UTF_8));
+                        // 区间售罄广播：余票刷新为 0 → 置位（15s 自愈 TTL），恢复 > 0 → 清除
+                        byte[] flagKey = soldOutKey(trainId, stations.get(dep), stations.get(arr), entry.getKey())
+                                .getBytes(StandardCharsets.UTF_8);
+                        if (count == 0) {
+                            soldOutKeys.add(flagKey);
+                        } else {
+                            restoredKeys.add(flagKey);
+                        }
                     }
                     comboIdx++;
                 }
             }
             return null;
         });
-        if (!suppressLog) {
-            log.info("余票展示层已刷新，车次：{}，组合数：{}", trainId, countsBySeatType.values().stream().mapToInt(a -> a.length).findAny().orElse(0));
-        }
-    }
-
-    /**
-     * 数据库统计兜底：不支持位图的车次（卧铺等）按站段组合 × 坐席逐项 COUNT，刷新降频
-     */
-    private void refreshDbFallbackTrain(String trainId) {
-        long now = System.currentTimeMillis();
-        Long last = dbFallbackLastRun.get(trainId);
-        if (last != null && now - last < 12_000L) {
-            return;
-        }
-        dbFallbackLastRun.put(trainId, now);
-        List<String> stations = stationCache.get(trainId, k -> listStationOrdered(trainId));
-        if (CollUtil.isEmpty(stations) || stations.size() < 2) {
-            return;
-        }
-        int stationCount = stations.size();
-        List<Integer> seatTypes = seatMapper.selectList(Wrappers.lambdaQuery(SeatDO.class)
-                        .eq(SeatDO::getTrainId, Long.valueOf(trainId))
-                        .select(SeatDO::getSeatType))
-                .stream().map(SeatDO::getSeatType)
-                .distinct().collect(Collectors.toList());
-        if (CollUtil.isEmpty(seatTypes)) {
-            return;
-        }
-        Map<Integer, int[]> countsBySeatType = new HashMap<>();
-        int comboIdx = 0;
-        for (int dep = 0; dep < stations.size() - 1; dep++) {
-            for (int arr = dep + 1; arr < stations.size(); arr++) {
-                // 账本重叠语义：t_seat 为注册表，可用座位数 = 不与有效票区间重叠的注册座位数
-                List<SeatTypeCountDTO> countList = seatService.listSeatTypeCount(Long.valueOf(trainId),
-                        stations.get(dep), stations.get(arr), seatTypes);
-                Map<Integer, Integer> countByType = countList.stream()
-                        .collect(Collectors.toMap(SeatTypeCountDTO::getSeatType, SeatTypeCountDTO::getSeatCount, (a, b) -> a));
-                for (Integer seatType : seatTypes) {
-                    countsBySeatType.computeIfAbsent(seatType, k -> new int[stationCount * (stationCount - 1) / 2])[comboIdx] =
-                            countByType.getOrDefault(seatType, 0);
+        if (!soldOutKeys.isEmpty() || !restoredKeys.isEmpty()) {
+            stringRedisTemplate.executePipelined((org.springframework.data.redis.core.RedisCallback<Object>) connection -> {
+                for (byte[] key : soldOutKeys) {
+                    connection.stringCommands().set(key, SOLD_OUT_VALUE,
+                            org.springframework.data.redis.core.types.Expiration.seconds(SOLD_OUT_TTL_SECONDS),
+                            org.springframework.data.redis.connection.RedisStringCommands.SetOption.UPSERT);
                 }
-                comboIdx++;
-            }
+                for (byte[] key : restoredKeys) {
+                    connection.keyCommands().del(key);
+                }
+                return null;
+            });
         }
-        writeDisplayKeys(trainId, stations, countsBySeatType, true);
+        log.debug("余票展示层已刷新，车次：{}，售罄标志 {} 个、恢复 {} 个", trainId, soldOutKeys.size(), restoredKeys.size());
     }
 
-    private List<String> listStationOrdered(String trainId) {
-        List<TrainStationDO> stationRows = trainStationMapper.selectList(Wrappers.lambdaQuery(TrainStationDO.class)
-                .eq(TrainStationDO::getTrainId, Long.valueOf(trainId))
-                .orderByAsc(TrainStationDO::getSequence));
-        List<String> stations = stationRows.stream()
-                .map(TrainStationDO::getDeparture)
-                .collect(Collectors.toList());
-        if (!stationRows.isEmpty()) {
-            String lastArrival = stationRows.get(stationRows.size() - 1).getArrival();
-            if (StrUtil.isNotBlank(lastArrival)) {
-                stations.add(lastArrival);
-            }
-        }
-        return stations;
-    }
 }

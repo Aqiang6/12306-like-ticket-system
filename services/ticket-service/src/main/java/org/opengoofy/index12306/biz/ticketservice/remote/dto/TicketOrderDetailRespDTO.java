@@ -35,6 +35,9 @@ public class TicketOrderDetailRespDTO {
      */
     private String orderSn;
 
+    /** 订单状态，与订单服务详情接口保持一致。 */
+    private Integer status;
+
     /**
      * 列车 ID
      */

@@ -43,13 +43,4 @@ public interface SeatMapper extends BaseMapper<SeatDO> {
      * 获取列车 startStation 到 endStation 区间可用座位数量
      */
     List<SeatTypeCountDTO> listSeatTypeCount(@Param("trainId") Long trainId, @Param("startStation") String startStation, @Param("endStation") String endStation, @Param("seatTypes") List<Integer> seatTypes);
-
-    /**
-     * 查询指定车厢内指定区间可用的座位号（位图缺失时的数据库兜底查询）
-     */
-    List<String> listAvailableSeatNumber(@Param("trainId") Long trainId,
-                                         @Param("carriageNumber") String carriageNumber,
-                                         @Param("seatType") Integer seatType,
-                                         @Param("departure") String departure,
-                                         @Param("arrival") String arrival);
 }

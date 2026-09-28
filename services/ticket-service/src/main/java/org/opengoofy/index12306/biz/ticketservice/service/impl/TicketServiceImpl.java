@@ -33,6 +33,7 @@ import com.google.common.collect.Lists;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.opengoofy.index12306.biz.ticketservice.common.enums.ChangeTicketTypeEnum;
+import org.opengoofy.index12306.biz.ticketservice.common.exception.IntervalSoldOutException;
 import org.opengoofy.index12306.biz.ticketservice.common.enums.RefundTypeEnum;
 import org.opengoofy.index12306.biz.ticketservice.common.enums.SourceEnum;
 import org.opengoofy.index12306.biz.ticketservice.common.enums.TicketChainMarkEnum;
@@ -84,6 +85,7 @@ import org.opengoofy.index12306.biz.ticketservice.service.handler.ticket.dto.Tra
 import org.opengoofy.index12306.biz.ticketservice.service.handler.ticket.ratelimit.TicketPurchaseRateLimiter;
 import org.opengoofy.index12306.biz.ticketservice.service.cache.TicketStockDisplayRefresher;
 import org.opengoofy.index12306.biz.ticketservice.service.handler.ticket.select.TrainSeatTypeSelector;
+import org.opengoofy.index12306.biz.ticketservice.toolkit.SeatBitMapUtil;
 import org.opengoofy.index12306.biz.ticketservice.toolkit.ChangeTicketFeeCalculateUtil;
 import org.opengoofy.index12306.biz.ticketservice.toolkit.DateUtil;
 import org.opengoofy.index12306.biz.ticketservice.toolkit.TimeStringComparator;
@@ -112,6 +114,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.LocalDate;
@@ -126,7 +129,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
@@ -188,129 +190,10 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
      */
     private static final int ORDER_ITEM_STATUS_ALREADY_PAID = 10;
 
-    @Override
-    public TicketPageQueryRespDTO pageListTicketQueryV1(TicketPageQueryReqDTO requestParam) {
-        // 责任链模式 验证城市名称是否存在、不存在加载缓存以及出发日期不能小于当前日期等等
-        ticketPageQueryAbstractChainContext.handler(TicketChainMarkEnum.TRAIN_QUERY_FILTER.name(), requestParam);
-        StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
-        // 列车查询逻辑较为复杂，详细解析文章查看 https://nageoffer.com/12306/question
-        // v1 版本存在严重的性能深渊问题，v2 版本完美的解决了该问题。通过 Jmeter 压测聚合报告得知，性能提升在 300% - 500%+
-        List<Object> stationDetails = stringRedisTemplate.opsForHash()
-                .multiGet(REGION_TRAIN_STATION_MAPPING, Lists.newArrayList(requestParam.getFromStation(), requestParam.getToStation()));
-        long count = stationDetails.stream().filter(Objects::isNull).count();
-        if (count > 0) {
-            RLock lock = redissonClient.getLock(LOCK_REGION_TRAIN_STATION_MAPPING);
-            lock.lock();
-            try {
-                stationDetails = stringRedisTemplate.opsForHash()
-                        .multiGet(REGION_TRAIN_STATION_MAPPING, Lists.newArrayList(requestParam.getFromStation(), requestParam.getToStation()));
-                count = stationDetails.stream().filter(Objects::isNull).count();
-                if (count > 0) {
-                    List<StationDO> stationDOList = stationMapper.selectList(Wrappers.emptyWrapper());
-                    Map<String, String> regionTrainStationMap = new HashMap<>();
-                    stationDOList.forEach(each -> regionTrainStationMap.put(each.getCode(), each.getRegionName()));
-                    stringRedisTemplate.opsForHash().putAll(REGION_TRAIN_STATION_MAPPING, regionTrainStationMap);
-                    stationDetails = new ArrayList<>();
-                    stationDetails.add(regionTrainStationMap.get(requestParam.getFromStation()));
-                    stationDetails.add(regionTrainStationMap.get(requestParam.getToStation()));
-                }
-            } finally {
-                lock.unlock();
-            }
-        }
-        List<TicketListDTO> seatResults = new ArrayList<>();
-        String buildRegionTrainStationHashKey = String.format(REGION_TRAIN_STATION, stationDetails.get(0), stationDetails.get(1));
-        Map<Object, Object> regionTrainStationAllMap = stringRedisTemplate.opsForHash().entries(buildRegionTrainStationHashKey);
-        if (MapUtil.isEmpty(regionTrainStationAllMap)) {
-            RLock lock = redissonClient.getLock(LOCK_REGION_TRAIN_STATION);
-            lock.lock();
-            try {
-                regionTrainStationAllMap = stringRedisTemplate.opsForHash().entries(buildRegionTrainStationHashKey);
-                if (MapUtil.isEmpty(regionTrainStationAllMap)) {
-                    LambdaQueryWrapper<TrainStationRelationDO> queryWrapper = Wrappers.lambdaQuery(TrainStationRelationDO.class)
-                            .eq(TrainStationRelationDO::getStartRegion, stationDetails.get(0))
-                            .eq(TrainStationRelationDO::getEndRegion, stationDetails.get(1));
-                    List<TrainStationRelationDO> trainStationRelationList = trainStationRelationMapper.selectList(queryWrapper);
-                    for (TrainStationRelationDO each : trainStationRelationList) {
-                        TrainDO trainDO = distributedCache.safeGet(
-                                TRAIN_INFO + each.getTrainId(),
-                                TrainDO.class,
-                                () -> trainMapper.selectById(each.getTrainId()),
-                                ADVANCE_TICKET_DAY,
-                                TimeUnit.DAYS);
-                        TicketListDTO result = new TicketListDTO();
-                        result.setTrainId(String.valueOf(trainDO.getId()));
-                        result.setTrainNumber(trainDO.getTrainNumber());
-                        result.setDepartureTime(convertDateToLocalTime(each.getDepartureTime(), "HH:mm"));
-                        result.setArrivalTime(convertDateToLocalTime(each.getArrivalTime(), "HH:mm"));
-                        result.setDuration(DateUtil.calculateHourDifference(each.getDepartureTime(), each.getArrivalTime()));
-                        result.setDeparture(each.getDeparture());
-                        result.setArrival(each.getArrival());
-                        result.setDepartureFlag(each.getDepartureFlag());
-                        result.setArrivalFlag(each.getArrivalFlag());
-                        result.setTrainType(trainDO.getTrainType());
-                        result.setTrainBrand(trainDO.getTrainBrand());
-                        if (StrUtil.isNotBlank(trainDO.getTrainTag())) {
-                            result.setTrainTags(StrUtil.split(trainDO.getTrainTag(), ","));
-                        }
-                        long betweenDay = cn.hutool.core.date.DateUtil.betweenDay(each.getDepartureTime(), each.getArrivalTime(), false);
-                        result.setDaysArrived((int) betweenDay);
-                        result.setSaleStatus(new Date().after(trainDO.getSaleTime()) ? 0 : 1);
-                        result.setSaleTime(convertDateToLocalTime(trainDO.getSaleTime(), "MM-dd HH:mm"));
-                        seatResults.add(result);
-                        regionTrainStationAllMap.put(CacheUtil.buildKey(String.valueOf(each.getTrainId()), each.getDeparture(), each.getArrival()), JSON.toJSONString(result));
-                    }
-                    stringRedisTemplate.opsForHash().putAll(buildRegionTrainStationHashKey, regionTrainStationAllMap);
-                }
-            } finally {
-                lock.unlock();
-            }
-        }
-        seatResults = CollUtil.isEmpty(seatResults)
-                ? regionTrainStationAllMap.values().stream().map(each -> JSON.parseObject(each.toString(), TicketListDTO.class)).toList()
-                : seatResults;
-        seatResults = seatResults.stream().sorted(new TimeStringComparator()).toList();
-        for (TicketListDTO each : seatResults) {
-            String trainStationPriceStr = distributedCache.safeGet(
-                    String.format(TRAIN_STATION_PRICE, each.getTrainId(), each.getDeparture(), each.getArrival()),
-                    String.class,
-                    () -> {
-                        LambdaQueryWrapper<TrainStationPriceDO> trainStationPriceQueryWrapper = Wrappers.lambdaQuery(TrainStationPriceDO.class)
-                                .eq(TrainStationPriceDO::getDeparture, each.getDeparture())
-                                .eq(TrainStationPriceDO::getArrival, each.getArrival())
-                                .eq(TrainStationPriceDO::getTrainId, each.getTrainId());
-                        return JSON.toJSONString(trainStationPriceMapper.selectList(trainStationPriceQueryWrapper));
-                    },
-                    ADVANCE_TICKET_DAY,
-                    TimeUnit.DAYS
-            );
-            List<TrainStationPriceDO> trainStationPriceDOList = JSON.parseArray(trainStationPriceStr, TrainStationPriceDO.class);
-            List<SeatClassDTO> seatClassList = new ArrayList<>();
-            trainStationPriceDOList.forEach(item -> {
-                String seatType = String.valueOf(item.getSeatType());
-                String keySuffix = StrUtil.join("_", each.getTrainId(), item.getDeparture(), item.getArrival());
-                ticketStockDisplayRefresher.touch(String.valueOf(each.getTrainId()));
-                // 首页/按钮读余票缓存（3s 周期由刷新器从位图/DB 重写，只读不扣减）
-                Object quantityObj = stringRedisTemplate.opsForHash().get(TRAIN_STATION_REMAINING_TICKET + keySuffix, seatType);
-                int quantity = Optional.ofNullable(quantityObj)
-                        .map(Object::toString)
-                        .map(Integer::parseInt)
-                        .orElseGet(() -> {
-                            Map<String, String> seatMarginMap = seatMarginCacheLoader.load(String.valueOf(each.getTrainId()), seatType, item.getDeparture(), item.getArrival());
-                            return Optional.ofNullable(seatMarginMap.get(String.valueOf(item.getSeatType()))).map(Integer::parseInt).orElse(0);
-                        });
-                seatClassList.add(new SeatClassDTO(item.getSeatType(), quantity, new BigDecimal(item.getPrice()).divide(new BigDecimal("100"), 1, RoundingMode.HALF_UP), false));
-            });
-            each.setSeatClassList(seatClassList);
-        }
-        return TicketPageQueryRespDTO.builder()
-                .trainList(seatResults)
-                .departureStationList(buildDepartureStationList(seatResults))
-                .arrivalStationList(buildArrivalStationList(seatResults))
-                .trainBrandList(buildTrainBrandList(seatResults))
-                .seatClassTypeList(buildSeatClassList(seatResults))
-                .build();
-    }
+    /**
+     * 订单已关闭状态（{@code OrderStatusEnum.CLOSED}），用于取消幂等补偿判定
+     */
+    private static final int ORDER_STATUS_CLOSED = 30;
 
     @Override
     public TicketPageQueryRespDTO pageListTicketQueryV2(TicketPageQueryReqDTO requestParam) {
@@ -319,44 +202,74 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
         StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
         // 列车查询逻辑较为复杂，详细解析文章查看 https://nageoffer.com/12306/question
         // v2 版本更符合企业级高并发真实场景解决方案，完美解决了 v1 版本性能深渊问题。通过 Jmeter 压测聚合报告得知，性能提升在 300% - 500%+
-        // 其实还能有 v3 版本，性能估计在原基础上还能进一步提升一倍。不过 v3 版本太过于复杂，不易读且不易扩展，就不写具体的代码了。面试中 v2 版本已经够和面试官吹的了
-        List<Object> stationDetails = stringRedisTemplate.opsForHash()
-                .multiGet(REGION_TRAIN_STATION_MAPPING, Lists.newArrayList(requestParam.getFromStation(), requestParam.getToStation()));
+        List<Object> stationDetails = loadRegionStationMapping(stringRedisTemplate, requestParam.getFromStation(), requestParam.getToStation());
         String buildRegionTrainStationHashKey = String.format(REGION_TRAIN_STATION, stationDetails.get(0), stationDetails.get(1));
         Map<Object, Object> regionTrainStationAllMap = stringRedisTemplate.opsForHash().entries(buildRegionTrainStationHashKey);
+        if (MapUtil.isEmpty(regionTrainStationAllMap)) {
+            regionTrainStationAllMap = loadRegionTrainStationHash(stringRedisTemplate, buildRegionTrainStationHashKey, stationDetails);
+        }
         List<TicketListDTO> seatResults = regionTrainStationAllMap.values().stream()
                 .map(each -> JSON.parseObject(each.toString(), TicketListDTO.class))
+                .filter(each -> Objects.equals(each.getTrainType(), 0))
                 .sorted(new TimeStringComparator())
                 .toList();
+        // 票价缓存 pipeline 预取；冷缓存缺失逐条回源装载
         List<String> trainStationPriceKeys = seatResults.stream()
                 .map(each -> String.format(cacheRedisPrefix + TRAIN_STATION_PRICE, each.getTrainId(), each.getDeparture(), each.getArrival()))
                 .toList();
         List<Object> trainStationPriceObjs = stringRedisTemplate.executePipelined((RedisCallback<String>) connection -> {
-            trainStationPriceKeys.forEach(each -> connection.stringCommands().get(each.getBytes()));
+            trainStationPriceKeys.forEach(each -> connection.stringCommands().get(each.getBytes(StandardCharsets.UTF_8)));
             return null;
         });
         List<TrainStationPriceDO> trainStationPriceDOList = new ArrayList<>();
-        List<String> trainStationRemainingKeyList = new ArrayList<>();
-        for (Object each : trainStationPriceObjs) {
-            List<TrainStationPriceDO> trainStationPriceList = JSON.parseArray(each.toString(), TrainStationPriceDO.class);
-            trainStationPriceDOList.addAll(trainStationPriceList);
-            for (TrainStationPriceDO item : trainStationPriceList) {
-                String trainStationRemainingKey = cacheRedisPrefix + TRAIN_STATION_REMAINING_TICKET + StrUtil.join("_", item.getTrainId(), item.getDeparture(), item.getArrival());
-                trainStationRemainingKeyList.add(trainStationRemainingKey);
-            }
+        for (int i = 0; i < seatResults.size(); i++) {
+            TicketListDTO each = seatResults.get(i);
+            // 查询触达登记活跃车次：展示刷新器 3s 周期接管该车次余票重写
+            ticketStockDisplayRefresher.touch(each.getTrainId());
+            Object priceObj = trainStationPriceObjs.get(i);
+            String trainStationPriceStr = priceObj != null ? priceObj.toString()
+                    : distributedCache.safeGet(
+                            String.format(TRAIN_STATION_PRICE, each.getTrainId(), each.getDeparture(), each.getArrival()),
+                            String.class,
+                            () -> JSON.toJSONString(trainStationPriceMapper.selectList(Wrappers.lambdaQuery(TrainStationPriceDO.class)
+                                    .eq(TrainStationPriceDO::getTrainId, Long.valueOf(each.getTrainId()))
+                                    .eq(TrainStationPriceDO::getDeparture, each.getDeparture())
+                                    .eq(TrainStationPriceDO::getArrival, each.getArrival()))),
+                            ADVANCE_TICKET_DAY,
+                            TimeUnit.DAYS);
+            trainStationPriceDOList.addAll(JSON.parseArray(trainStationPriceStr, TrainStationPriceDO.class)
+                    .stream().filter(price -> SeatBitMapUtil.supports(price.getSeatType())).toList());
         }
+        // 余票展示缓存 pipeline 预取；车次未被刷新器触达时逐条回源账本统计（装载器会预热该车次全部区间展示缓存）
+        List<String> trainStationRemainingKeyList = trainStationPriceDOList.stream()
+                .map(item -> cacheRedisPrefix + TRAIN_STATION_REMAINING_TICKET + StrUtil.join("_", item.getTrainId(), item.getDeparture(), item.getArrival()))
+                .toList();
         List<Object> trainStationRemainingObjs = stringRedisTemplate.executePipelined((RedisCallback<String>) connection -> {
             for (int i = 0; i < trainStationRemainingKeyList.size(); i++) {
-                connection.hashCommands().hGet(trainStationRemainingKeyList.get(i).getBytes(), trainStationPriceDOList.get(i).getSeatType().toString().getBytes());
+                // Key 含中文站名：必须显式 UTF-8，JVM 默认字符集（Windows GBK）会读到另一族乱码键
+                connection.hashCommands().hGet(trainStationRemainingKeyList.get(i).getBytes(StandardCharsets.UTF_8), trainStationPriceDOList.get(i).getSeatType().toString().getBytes(StandardCharsets.UTF_8));
             }
             return null;
         });
         for (TicketListDTO each : seatResults) {
-            List<Integer> seatTypesByCode = VehicleTypeEnum.findSeatTypesByCode(each.getTrainType());
-            List<Object> remainingTicket = new ArrayList<>(trainStationRemainingObjs.subList(0, seatTypesByCode.size()));
-            List<TrainStationPriceDO> trainStationPriceDOSub = new ArrayList<>(trainStationPriceDOList.subList(0, seatTypesByCode.size()));
-            trainStationRemainingObjs.subList(0, seatTypesByCode.size()).clear();
-            trainStationPriceDOList.subList(0, seatTypesByCode.size()).clear();
+            int priceCount = (int) trainStationPriceDOList.stream()
+                    .filter(price -> Objects.equals(String.valueOf(price.getTrainId()), each.getTrainId())
+                            && Objects.equals(price.getDeparture(), each.getDeparture())
+                            && Objects.equals(price.getArrival(), each.getArrival())).count();
+            List<TrainStationPriceDO> trainStationPriceDOSub = new ArrayList<>(trainStationPriceDOList.subList(0, priceCount));
+            List<Object> remainingTicket = new ArrayList<>(priceCount);
+            for (int i = 0; i < priceCount; i++) {
+                TrainStationPriceDO item = trainStationPriceDOSub.get(i);
+                Object quantityObj = trainStationRemainingObjs.get(i);
+                if (quantityObj != null) {
+                    remainingTicket.add(quantityObj);
+                } else {
+                    Map<String, String> seatMarginMap = seatMarginCacheLoader.load(String.valueOf(item.getTrainId()), String.valueOf(item.getSeatType()), item.getDeparture(), item.getArrival());
+                    remainingTicket.add(seatMarginMap.getOrDefault(String.valueOf(item.getSeatType()), "0"));
+                }
+            }
+            trainStationRemainingObjs.subList(0, priceCount).clear();
+            trainStationPriceDOList.subList(0, priceCount).clear();
             List<SeatClassDTO> seatClassList = new ArrayList<>();
             for (int i = 0; i < trainStationPriceDOSub.size(); i++) {
                 TrainStationPriceDO trainStationPriceDO = trainStationPriceDOSub.get(i);
@@ -379,6 +292,94 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
                 .build();
     }
 
+    /**
+     * 城市-车站映射缓存装载：缓存缺失时加锁回源站点表全量重写
+     */
+    private List<Object> loadRegionStationMapping(StringRedisTemplate stringRedisTemplate, String fromStation, String toStation) {
+        List<Object> stationDetails = stringRedisTemplate.opsForHash()
+                .multiGet(REGION_TRAIN_STATION_MAPPING, Lists.newArrayList(fromStation, toStation));
+        long count = stationDetails.stream().filter(Objects::isNull).count();
+        if (count > 0) {
+            RLock lock = redissonClient.getLock(LOCK_REGION_TRAIN_STATION_MAPPING);
+            lock.lock();
+            try {
+                stationDetails = stringRedisTemplate.opsForHash()
+                        .multiGet(REGION_TRAIN_STATION_MAPPING, Lists.newArrayList(fromStation, toStation));
+                count = stationDetails.stream().filter(Objects::isNull).count();
+                if (count > 0) {
+                    List<StationDO> stationDOList = stationMapper.selectList(Wrappers.emptyWrapper());
+                    Map<String, String> regionTrainStationMap = new HashMap<>();
+                    stationDOList.forEach(each -> regionTrainStationMap.put(each.getCode(), each.getRegionName()));
+                    stringRedisTemplate.opsForHash().putAll(REGION_TRAIN_STATION_MAPPING, regionTrainStationMap);
+                    stationDetails = new ArrayList<>();
+                    stationDetails.add(regionTrainStationMap.get(fromStation));
+                    stationDetails.add(regionTrainStationMap.get(toStation));
+                }
+            } finally {
+                lock.unlock();
+            }
+        }
+        return stationDetails;
+    }
+
+    /**
+     * 城市对车次列表缓存装载：缓存缺失时加锁回源车站关系表构建车次卡片并重写缓存
+     */
+    private Map<Object, Object> loadRegionTrainStationHash(StringRedisTemplate stringRedisTemplate, String buildRegionTrainStationHashKey, List<Object> stationDetails) {
+        Map<Object, Object> regionTrainStationAllMap;
+        RLock lock = redissonClient.getLock(LOCK_REGION_TRAIN_STATION);
+        lock.lock();
+        try {
+            regionTrainStationAllMap = stringRedisTemplate.opsForHash().entries(buildRegionTrainStationHashKey);
+            if (MapUtil.isEmpty(regionTrainStationAllMap)) {
+                LambdaQueryWrapper<TrainStationRelationDO> queryWrapper = Wrappers.lambdaQuery(TrainStationRelationDO.class)
+                        .eq(TrainStationRelationDO::getStartRegion, stationDetails.get(0))
+                        .eq(TrainStationRelationDO::getEndRegion, stationDetails.get(1));
+                List<TrainStationRelationDO> trainStationRelationList = trainStationRelationMapper.selectList(queryWrapper);
+                Map<Object, Object> regionTrainStationMap = new HashMap<>();
+                for (TrainStationRelationDO each : trainStationRelationList) {
+                    TrainDO trainDO = distributedCache.safeGet(
+                            TRAIN_INFO + each.getTrainId(),
+                            TrainDO.class,
+                            () -> trainMapper.selectById(each.getTrainId()),
+                            ADVANCE_TICKET_DAY,
+                            TimeUnit.DAYS);
+                    // 城市对关系可能残留已下架（逻辑删除）或非高铁车次：selectById 查不到即跳过
+                    if (trainDO == null || !Objects.equals(trainDO.getTrainType(), 0)) {
+                        continue;
+                    }
+                    TicketListDTO result = new TicketListDTO();
+                    result.setTrainId(String.valueOf(trainDO.getId()));
+                    result.setTrainNumber(trainDO.getTrainNumber());
+                    result.setDepartureTime(convertDateToLocalTime(each.getDepartureTime(), "HH:mm"));
+                    result.setArrivalTime(convertDateToLocalTime(each.getArrivalTime(), "HH:mm"));
+                    result.setDuration(DateUtil.calculateHourDifference(each.getDepartureTime(), each.getArrivalTime()));
+                    result.setDeparture(each.getDeparture());
+                    result.setArrival(each.getArrival());
+                    result.setDepartureFlag(each.getDepartureFlag());
+                    result.setArrivalFlag(each.getArrivalFlag());
+                    result.setTrainType(trainDO.getTrainType());
+                    result.setTrainBrand(trainDO.getTrainBrand());
+                    if (StrUtil.isNotBlank(trainDO.getTrainTag())) {
+                        result.setTrainTags(StrUtil.split(trainDO.getTrainTag(), ",").stream()
+                                .filter(Set.of("0", "1", "2")::contains)
+                                .toList());
+                    }
+                    long betweenDay = cn.hutool.core.date.DateUtil.betweenDay(each.getDepartureTime(), each.getArrivalTime(), false);
+                    result.setDaysArrived((int) betweenDay);
+                    result.setSaleStatus(new Date().after(trainDO.getSaleTime()) ? 0 : 1);
+                    result.setSaleTime(convertDateToLocalTime(trainDO.getSaleTime(), "MM-dd HH:mm"));
+                    regionTrainStationMap.put(CacheUtil.buildKey(String.valueOf(each.getTrainId()), each.getDeparture(), each.getArrival()), JSON.toJSONString(result));
+                }
+                stringRedisTemplate.opsForHash().putAll(buildRegionTrainStationHashKey, regionTrainStationMap);
+                regionTrainStationAllMap = regionTrainStationMap;
+            }
+        } finally {
+            lock.unlock();
+        }
+        return regionTrainStationAllMap;
+    }
+
     private final Cache<String, ReentrantLock> localLockMap = Caffeine.newBuilder()
             .expireAfterWrite(1, TimeUnit.DAYS)
             .build();
@@ -397,10 +398,17 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
     public TicketPurchaseRespDTO purchaseTicketsV2(PurchaseTicketReqDTO requestParam) {
         // 责任链模式，验证 1：参数必填 2：参数正确性 3：乘客是否已买当前车次等...
         purchaseTicketAbstractChainContext.handler(TicketChainMarkEnum.TRAIN_PURCHASE_TICKET_FILTER.name(), requestParam);
-        // 分层准入：余票缓存只读（3s 周期从位图/DB 刷新，见 TicketStockDisplayRefresher），
-        // 售罄由前置责任链余票预判拦截；准入节奏由令牌桶控制（容量 = 余票 × 倍数 + 固定补充速率），
+        // 分层准入：余票缓存是 3s 周期快照，仅用于令牌桶容量；
+        // 准入节奏由令牌桶控制（容量 = 请求区间与席别的余票 × 倍数 + 固定补充速率），
         // 超卖由锁内座位位图 + DB 校验兜底
-        if (!ticketPurchaseRateLimiter.tryAcquire(requestParam.getTrainId(), requestParam.getDeparture(), requestParam.getArrival())) {
+        List<Integer> requestSeatTypes = requestParam.getPassengers().stream()
+                .map(PurchaseTicketPassengerDetailDTO::getSeatType).distinct().toList();
+        // 区间售罄广播逐出（排队前）：展示余票 3s 周期刷新为 0 即置位，所需席别任一售完直接秒拒，不消耗令牌
+        if (ticketStockDisplayRefresher.anySoldOut(requestParam.getTrainId(), requestParam.getDeparture(),
+                requestParam.getArrival(), requestSeatTypes)) {
+            throw new IntervalSoldOutException("当前区间坐席已售完，请选择其他车次或席别");
+        }
+        if (!ticketPurchaseRateLimiter.tryAcquire(requestParam)) {
             throw new ServiceException("当前购票请求较多，请稍后重试");
         }
         List<ReentrantLock> localLockList = new ArrayList<>();
@@ -426,12 +434,17 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
         ticketStockDisplayRefresher.touch(requestParam.getTrainId());
         TicketPurchasePrepareDTO prepare;
         try {
-            // 分片 tryLock 获取两级公平锁，等待中周期检查售罄广播：售罄即退出队列，不空等锁位
-            acquirePurchaseLocksFairly(localLockList, distributedLockList, requestParam);
+            // 已获得令牌的请求保留排队资格；展示缓存可能滞后，不能据此逐出仍有机会锁座的请求。
+            // 但区间售罄广播（展示余票刷新为 0）置位后，等待线程会被整队逐出，见 acquirePurchaseLocksFairly。
+            acquirePurchaseLocksFairly(requestParam, localLockList, distributedLockList);
             // 临界区仅保留：选座 + 锁座 + 车票落库，订单创建移至锁外
             prepare = ticketService.preparePurchaseTickets(requestParam);
         } catch (Throwable ex) {
-            log.error("购票临界区执行失败，请求参数：{}", JSON.toJSONString(requestParam), ex);
+            if (ex instanceof IntervalSoldOutException) {
+                log.warn("区间售罄广播逐出排队请求，请求参数：{}", JSON.toJSONString(requestParam));
+            } else {
+                log.error("购票临界区执行失败，请求参数：{}", JSON.toJSONString(requestParam), ex);
+            }
             throw ex;
         } finally {
             localLockList.forEach(localLock -> {
@@ -451,21 +464,26 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
     }
 
     /**
-     * 分片获取两级公平锁：每 200ms 一次 tryLock，分片间检查售罄广播（任一所需坐席售罄即整单退出），
-     * 避免售罄后排队者逐个空等到号；总等待超上限按限流提示退出。
+     * 售罄广播逐出检查轮数：每 5 轮（约 1s）读一次区间售罄标志，兼顾逐出时效与 Redis 读压力
+     */
+    private static final int SOLD_OUT_CHECK_ROUNDS = 5;
+
+    /**
+     * 分片获取两级公平锁：每 200ms 一次 tryLock；总等待超上限按限流提示退出；
+     * 等待期间观测区间售罄广播（展示余票刷新为 0），所需席别售完即整队逐出，不空等锁位。
      * 部分获取失败时逆序释放已持有锁，保持与既有加锁顺序一致的防死锁纪律。
      */
-    private void acquirePurchaseLocksFairly(List<ReentrantLock> localLockList, List<RLock> distributedLockList,
-                                            PurchaseTicketReqDTO requestParam) {
-        Set<Integer> seatTypes = requestParam.getPassengers().stream()
-                .map(PurchaseTicketPassengerDetailDTO::getSeatType).collect(Collectors.toSet());
+    private void acquirePurchaseLocksFairly(PurchaseTicketReqDTO requestParam, List<ReentrantLock> localLockList, List<RLock> distributedLockList) {
         long deadline = System.currentTimeMillis() + maxWaitMs;
+        List<Integer> seatTypes = requestParam.getPassengers().stream()
+                .map(PurchaseTicketPassengerDetailDTO::getSeatType).distinct().toList();
         for (ReentrantLock localLock : localLockList) {
+            int waitRounds = 0;
             while (true) {
-                checkSoldOutBroadcast(requestParam, seatTypes);
                 if (System.currentTimeMillis() > deadline) {
                     throw new ServiceException("当前购票请求较多，请稍后重试");
                 }
+                throwIfIntervalSoldOut(requestParam, seatTypes, waitRounds++);
                 try {
                     if (localLock.tryLock(200, TimeUnit.MILLISECONDS)) {
                         break;
@@ -479,11 +497,12 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
         List<RLock> acquired = new ArrayList<>();
         try {
             for (RLock distributedLock : distributedLockList) {
+                int waitRounds = 0;
                 while (true) {
-                    checkSoldOutBroadcast(requestParam, seatTypes);
                     if (System.currentTimeMillis() > deadline) {
                         throw new ServiceException("当前购票请求较多，请稍后重试");
                     }
+                    throwIfIntervalSoldOut(requestParam, seatTypes, waitRounds++);
                     try {
                         if (distributedLock.tryLock(200, TimeUnit.MILLISECONDS)) {
                             acquired.add(distributedLock);
@@ -506,10 +525,18 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
         }
     }
 
-    private void checkSoldOutBroadcast(PurchaseTicketReqDTO requestParam, Set<Integer> seatTypes) {
-        if (ticketStockDisplayRefresher.isSoldOut(requestParam.getTrainId(), requestParam.getDeparture(),
+    /**
+     * 等待期间的售罄逐出：所需席别在当前区间的展示余票被刷新为 0（广播置位）即抛出，
+     * 排队线程立即退出队列，不再进临界区做注定失败的选座。位图 CAS 仍是可售性的最终裁决，
+     * 广播只是排队加速器，误置位的最坏代价是少卖（3s 内可由刷新周期纠正）。
+     */
+    private void throwIfIntervalSoldOut(PurchaseTicketReqDTO requestParam, List<Integer> seatTypes, int waitRounds) {
+        if (waitRounds % SOLD_OUT_CHECK_ROUNDS != 0) {
+            return;
+        }
+        if (ticketStockDisplayRefresher.anySoldOut(requestParam.getTrainId(), requestParam.getDeparture(),
                 requestParam.getArrival(), seatTypes)) {
-            throw new ClientException("车票已售完，您可提交候补订单或选择其他车次");
+            throw new IntervalSoldOutException("当前区间坐席已售完，请选择其他车次或席别");
         }
     }
 
@@ -521,25 +548,7 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
     }
 
     private TicketPurchasePrepareDTO doPreparePurchaseTickets(PurchaseTicketReqDTO requestParam, String trainId) {
-        // 售罄快速失败：排队至拿锁期间余票可能已被售罄（余票缓存 3s 周期刷新），
-        // 拿锁后先校验，避免注定失败的无效选座
-        StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
-        String stockKey = TRAIN_STATION_REMAINING_TICKET + StrUtil.join("_", trainId, requestParam.getDeparture(), requestParam.getArrival());
-        Map<Integer, Long> seatTypeNeed = requestParam.getPassengers().stream()
-                .collect(Collectors.groupingBy(PurchaseTicketPassengerDetailDTO::getSeatType, Collectors.counting()));
-        List<Object> stockValues = stringRedisTemplate.opsForHash().multiGet(stockKey,
-                seatTypeNeed.keySet().stream().map(String::valueOf).collect(Collectors.toList()));
-        for (int i = 0; i < seatTypeNeed.size(); i++) {
-            Object value = stockValues.get(i);
-            long stock = value == null ? 0L : Long.parseLong(value.toString());
-            long need = (Long) seatTypeNeed.values().toArray()[i];
-            if (stock < need) {
-                // 零点即时广播：排队到临界区才发现售罄时，立刻置位标志让仍在排队的等待线程快速退出
-                ticketStockDisplayRefresher.markSoldOut(trainId, requestParam.getDeparture(),
-                        requestParam.getArrival(), seatTypeNeed.keySet());
-                throw new ClientException("车票已售完，您可提交候补订单或选择其他车次");
-            }
-        }
+        // 展示余票是周期快照，锁内仍以座位位图的原子占位作最终裁决。
         // 节假日高并发购票Redis能扛得住么？详情查看：https://nageoffer.com/12306/question
         TrainDO trainDO = distributedCache.safeGet(
                 TRAIN_INFO + trainId,
@@ -726,35 +735,64 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
     @Override
     public void cancelTicketOrder(CancelTicketOrderReqDTO requestParam) {
         Result<Void> cancelOrderResult = ticketOrderRemoteService.cancelTicketOrder(requestParam);
-        if (cancelOrderResult.isSuccess() && !StrUtil.equals(ticketAvailabilityCacheUpdateType, "binlog")) {
-            Result<org.opengoofy.index12306.biz.ticketservice.remote.dto.TicketOrderDetailRespDTO> ticketOrderDetailResult = ticketOrderRemoteService.queryTicketOrderByOrderSn(requestParam.getOrderSn());
-            org.opengoofy.index12306.biz.ticketservice.remote.dto.TicketOrderDetailRespDTO ticketOrderDetail = ticketOrderDetailResult.getData();
-            String trainId = String.valueOf(ticketOrderDetail.getTrainId());
-            String departure = ticketOrderDetail.getDeparture();
-            String arrival = ticketOrderDetail.getArrival();
-            List<TicketOrderPassengerDetailRespDTO> trainPurchaseTicketResults = ticketOrderDetail.getPassengerDetails();
-            try {
-                seatService.unlock(trainId, departure, arrival, BeanUtil.convert(trainPurchaseTicketResults, TrainPurchaseTicketRespDTO.class));
-            } catch (Throwable ex) {
-                log.error("[取消订单] 订单号：{} 回滚列车DB座位状态失败", requestParam.getOrderSn(), ex);
-                throw ex;
+        if (cancelOrderResult.isSuccess()) {
+            if (!StrUtil.equals(ticketAvailabilityCacheUpdateType, "binlog")) {
+                org.opengoofy.index12306.biz.ticketservice.remote.dto.TicketOrderDetailRespDTO ticketOrderDetail = queryCancelOrderDetail(requestParam.getOrderSn());
+                releaseCancelledOrderResources(requestParam.getOrderSn(), ticketOrderDetail);
             }
-            try {
-                StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
-                Map<Integer, List<TicketOrderPassengerDetailRespDTO>> seatTypeMap = trainPurchaseTicketResults.stream()
-                        .collect(Collectors.groupingBy(TicketOrderPassengerDetailRespDTO::getSeatType));
-                List<RouteDTO> routeDTOList = trainStationService.listTakeoutTrainStationRoute(trainId, departure, arrival);
-                routeDTOList.forEach(each -> {
-                    String keySuffix = StrUtil.join("_", trainId, each.getStartStation(), each.getEndStation());
-                    seatTypeMap.forEach((seatType, ticketOrderPassengerDetailRespDTOList) -> {
-                        stringRedisTemplate.opsForHash()
-                                .increment(TRAIN_STATION_REMAINING_TICKET + keySuffix, String.valueOf(seatType), ticketOrderPassengerDetailRespDTOList.size());
-                    });
+            return;
+        }
+        // 远程关单失败：可能是与本调用的历史失败重试/延迟关单/并发取消竞态，订单已被先行关闭
+        // （订单服务对非待支付订单的关单直接报错，非幂等）。订单确已关闭时仍需补偿释放座位与余票缓存，
+        // 否则出现"订单已关、车票未解锁"的幻影占座；订单未关闭则原样抛出由调用方重试。
+        org.opengoofy.index12306.biz.ticketservice.remote.dto.TicketOrderDetailRespDTO ticketOrderDetail = queryCancelOrderDetail(requestParam.getOrderSn());
+        if (ticketOrderDetail == null || !Objects.equals(ticketOrderDetail.getStatus(), ORDER_STATUS_CLOSED)) {
+            throw new ServiceException("取消订单失败：" + cancelOrderResult.getMessage());
+        }
+        log.info("[取消订单] 订单已被其他流程关闭，补偿释放座位与余票缓存，订单号：{}", requestParam.getOrderSn());
+        if (!StrUtil.equals(ticketAvailabilityCacheUpdateType, "binlog")) {
+            releaseCancelledOrderResources(requestParam.getOrderSn(), ticketOrderDetail);
+        }
+    }
+
+    private org.opengoofy.index12306.biz.ticketservice.remote.dto.TicketOrderDetailRespDTO queryCancelOrderDetail(String orderSn) {
+        Result<org.opengoofy.index12306.biz.ticketservice.remote.dto.TicketOrderDetailRespDTO> ticketOrderDetailResult = ticketOrderRemoteService.queryTicketOrderByOrderSn(orderSn);
+        if (!ticketOrderDetailResult.isSuccess() || Objects.isNull(ticketOrderDetailResult.getData())) {
+            throw new ServiceException("取消订单查询订单详情失败：" + ticketOrderDetailResult.getMessage());
+        }
+        return ticketOrderDetailResult.getData();
+    }
+
+    /**
+     * 取消/关单后的资源释放：账本作废（CLOSED）+ 位图清位 + 沿途区间余票缓存回补。
+     * 释放动作天然幂等（账本条件更新、位图清 0、余票 +1 由 3s 刷新器周期重写纠偏），重复执行无副作用。
+     */
+    private void releaseCancelledOrderResources(String orderSn, org.opengoofy.index12306.biz.ticketservice.remote.dto.TicketOrderDetailRespDTO ticketOrderDetail) {
+        String trainId = String.valueOf(ticketOrderDetail.getTrainId());
+        String departure = ticketOrderDetail.getDeparture();
+        String arrival = ticketOrderDetail.getArrival();
+        List<TicketOrderPassengerDetailRespDTO> trainPurchaseTicketResults = ticketOrderDetail.getPassengerDetails();
+        try {
+            seatService.unlock(trainId, departure, arrival, BeanUtil.convert(trainPurchaseTicketResults, TrainPurchaseTicketRespDTO.class));
+        } catch (Throwable ex) {
+            log.error("[取消订单] 订单号：{} 回滚列车DB座位状态失败", orderSn, ex);
+            throw ex;
+        }
+        try {
+            StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
+            Map<Integer, List<TicketOrderPassengerDetailRespDTO>> seatTypeMap = trainPurchaseTicketResults.stream()
+                    .collect(Collectors.groupingBy(TicketOrderPassengerDetailRespDTO::getSeatType));
+            List<RouteDTO> routeDTOList = trainStationService.listTakeoutTrainStationRoute(trainId, departure, arrival);
+            routeDTOList.forEach(each -> {
+                String keySuffix = StrUtil.join("_", trainId, each.getStartStation(), each.getEndStation());
+                seatTypeMap.forEach((seatType, ticketOrderPassengerDetailRespDTOList) -> {
+                    stringRedisTemplate.opsForHash()
+                            .increment(TRAIN_STATION_REMAINING_TICKET + keySuffix, String.valueOf(seatType), ticketOrderPassengerDetailRespDTOList.size());
                 });
-            } catch (Throwable ex) {
-                log.error("[取消关闭订单] 订单号：{} 回滚列车Cache余票失败", requestParam.getOrderSn(), ex);
-                throw ex;
-            }
+            });
+        } catch (Throwable ex) {
+            log.error("[取消关闭订单] 订单号：{} 回滚列车Cache余票失败", orderSn, ex);
+            throw ex;
         }
     }
 
@@ -880,6 +918,10 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
             throw new ServiceException("开车后仅可在当日24点前办理改签");
         }
         TrainDO newTrainDO = queryChangeTrainInfo(requestParam.getNewTrainId());
+        if (!Objects.equals(newTrainDO.getTrainType(), 0)
+                || requestSeatTypeMap.values().stream().anyMatch(type -> !SeatBitMapUtil.supports(type))) {
+            throw new ServiceException("仅支持改签至商务座、一等座和二等座");
+        }
         TrainStationRelationDO newRelation = queryChangeTrainStationRelation(requestParam.getNewTrainId(), requestParam.getNewDeparture(), requestParam.getNewArrival());
         if (!convertDateToLocalDateTime(newRelation.getDepartureTime()).isAfter(now)) {
             throw new ServiceException("所选车次已发车，请重新选择改签车次");
@@ -955,9 +997,9 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
             purchaseLocks.add(purchaseLock);
         }
         try {
-            // 改签复用购票责任链：基于余票缓存只读预判新车次余量，再经限流令牌桶控制准入
+            // 改签复用购票责任链预热余票缓存，再经请求区间与席别的令牌桶控制准入
             purchaseTicketAbstractChainContext.handler(TicketChainMarkEnum.TRAIN_PURCHASE_TICKET_FILTER.name(), newPurchaseReq);
-            if (!ticketPurchaseRateLimiter.tryAcquire(newPurchaseReq.getTrainId(), newPurchaseReq.getDeparture(), newPurchaseReq.getArrival())) {
+            if (!ticketPurchaseRateLimiter.tryAcquire(newPurchaseReq)) {
                 throw new ServiceException("当前改签请求较多，请稍后重试");
             }
 

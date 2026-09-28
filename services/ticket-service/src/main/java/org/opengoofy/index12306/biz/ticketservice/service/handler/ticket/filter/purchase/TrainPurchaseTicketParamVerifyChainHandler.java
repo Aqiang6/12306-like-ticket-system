@@ -69,6 +69,9 @@ public class TrainPurchaseTicketParamVerifyChainHandler implements TrainPurchase
             // 如果一段时间有过几次的异常，直接封号处理。下述异常同理
             throw new ClientException("请检查车次是否存在");
         }
+        if (!Objects.equals(trainDO.getTrainType(), 0)) {
+            throw new ClientException("该车次不支持购票");
+        }
         // TODO，当前列车数据并没有通过定时任务每天生成最新的，所以需要隔离这个拦截。后期定时生成数据后删除该判断
         if (!EnvironmentUtil.isDevEnvironment()) {
             // 查询车次是否已经发售

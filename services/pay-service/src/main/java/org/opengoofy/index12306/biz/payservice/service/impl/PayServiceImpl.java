@@ -41,7 +41,6 @@ import org.opengoofy.index12306.biz.payservice.dto.base.RefundResponse;
 import org.opengoofy.index12306.biz.payservice.handler.AliPayNativeHandler;
 import org.opengoofy.index12306.biz.payservice.handler.AliRefundNativeHandler;
 import org.opengoofy.index12306.biz.payservice.mq.event.PayResultCallbackOrderEvent;
-import org.opengoofy.index12306.biz.payservice.mq.produce.PayResultCallbackOrderSendProduce;
 import org.opengoofy.index12306.biz.payservice.service.PayService;
 import org.opengoofy.index12306.biz.payservice.service.payid.PayIdGeneratorManager;
 import org.opengoofy.index12306.framework.starter.cache.DistributedCache;
@@ -75,7 +74,6 @@ public class PayServiceImpl implements PayService {
 
     private final PayMapper payMapper;
     private final AbstractStrategyChoose abstractStrategyChoose;
-    private final PayResultCallbackOrderSendProduce payResultCallbackOrderSendProduce;
     private final TicketOrderRemoteService ticketOrderRemoteService;
     private final DistributedCache distributedCache;
 
@@ -143,21 +141,35 @@ public class PayServiceImpl implements PayService {
             log.error("支付单不存在，orderRequestId：{}", requestParam.getOrderRequestId());
             throw new ServiceException("支付单不存在");
         }
+        // 已记录成功回调时不重建消息，也不允许迟到回调覆盖支付/退款状态。
+        if (payDO.getNotificationStatus() != null && payDO.getNotificationStatus() != 0) {
+            return;
+        }
+        Integer previousStatus = payDO.getStatus();
         payDO.setTradeNo(requestParam.getTradeNo());
         payDO.setStatus(requestParam.getStatus());
         payDO.setPayAmount(requestParam.getPayAmount());
         payDO.setGmtPayment(requestParam.getGmtPayment());
+        if (Objects.equals(requestParam.getStatus(), TradeStatusEnum.TRADE_SUCCESS.tradeCode())) {
+            payDO.setNotificationStatus(1);
+            payDO.setNotificationPayload(JSON.toJSONString(BeanUtil.convert(payDO, PayResultCallbackOrderEvent.class)));
+            payDO.setNotificationNextRetry(new Date());
+        }
         LambdaUpdateWrapper<PayDO> updateWrapper = Wrappers.lambdaUpdate(PayDO.class)
-                .eq(PayDO::getOrderSn, requestParam.getOrderSn());
+                .eq(PayDO::getOrderSn, requestParam.getOrderSn())
+                .eq(PayDO::getStatus, previousStatus)
+                .eq(PayDO::getNotificationStatus, 0);
         int result = payMapper.update(payDO, updateWrapper);
         if (result <= 0) {
+            PayDO latest = payMapper.selectOne(Wrappers.lambdaQuery(PayDO.class)
+                    .eq(PayDO::getOrderSn, requestParam.getOrderSn()).last("FOR UPDATE"));
+            if (latest != null && latest.getNotificationStatus() != null && latest.getNotificationStatus() != 0) {
+                return;
+            }
             log.error("修改支付单支付结果失败，支付单信息：{}", JSON.toJSONString(payDO));
             throw new ServiceException("修改支付单支付结果失败");
         }
-        // 交易成功，回调订单服务告知支付结果，修改订单流转状态
-        if (Objects.equals(requestParam.getStatus(), TradeStatusEnum.TRADE_SUCCESS.tradeCode())) {
-            payResultCallbackOrderSendProduce.sendMessage(BeanUtil.convert(payDO, PayResultCallbackOrderEvent.class));
-        }
+        // 此处只落库。独立扫描器读取已提交的发件箱并发送，事务失败时不会发出消息。
     }
 
     @Override
@@ -195,7 +207,7 @@ public class PayServiceImpl implements PayService {
         payDO.setStatus(result.getStatus());
         LambdaUpdateWrapper<PayDO> updateWrapper = Wrappers.lambdaUpdate(PayDO.class)
                 .eq(PayDO::getOrderSn, requestParam.getOrderSn());
-        int updateResult = payMapper.update(payDO, updateWrapper);
+        int updateResult = payMapper.update(null, updateWrapper.set(PayDO::getStatus, payDO.getStatus()));
         if (updateResult <= 0) {
             log.error("修改支付单退款结果失败，支付单信息：{}", JSON.toJSONString(payDO));
             throw new ServiceException("修改支付单退款结果失败");

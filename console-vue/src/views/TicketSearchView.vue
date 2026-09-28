@@ -683,17 +683,9 @@ const toggleStations = (train) => {
 }
 
 const SEAT_DISPLAY = [
-  { label: '商务座', types: [0, 12] },
+  { label: '商务座', types: [0] },
   { label: '一等座', types: [1] },
-  { label: '二等座', types: [2, 3] },
-  { label: '动卧', types: [10] },
-  { label: '高级软卧', types: [9] },
-  { label: '软卧/一等卧', types: [6, 4] },
-  { label: '硬卧/二等卧', types: [7, 5] },
-  { label: '软座', types: [11] },
-  { label: '硬座', types: [8] },
-  { label: '无座', types: [13] },
-  { label: '其他', types: [14] }
+  { label: '二等座', types: [2] }
 ]
 
 const seatCells = (seatClassList) =>

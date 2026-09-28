@@ -19,19 +19,11 @@ package org.opengoofy.index12306.biz.ticketservice.service.handler.ticket.filter
 
 import cn.hutool.core.util.StrUtil;
 import lombok.RequiredArgsConstructor;
-import org.opengoofy.index12306.biz.ticketservice.dto.domain.PurchaseTicketPassengerDetailDTO;
 import org.opengoofy.index12306.biz.ticketservice.dto.req.PurchaseTicketReqDTO;
 import org.opengoofy.index12306.biz.ticketservice.service.cache.SeatMarginCacheLoader;
-import org.opengoofy.index12306.biz.ticketservice.service.cache.TicketStockDisplayRefresher;
 import org.opengoofy.index12306.framework.starter.cache.DistributedCache;
-import org.opengoofy.index12306.framework.starter.convention.exception.ClientException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
-
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.stream.Collectors;
 
 import static org.opengoofy.index12306.biz.ticketservice.common.constant.RedisKeyConstant.TRAIN_STATION_REMAINING_TICKET;
 
@@ -45,29 +37,19 @@ public class TrainPurchaseTicketParamStockChainHandler implements TrainPurchaseT
 
     private final SeatMarginCacheLoader seatMarginCacheLoader;
     private final DistributedCache distributedCache;
-    private final TicketStockDisplayRefresher ticketStockDisplayRefresher;
 
     @Override
     public void handler(PurchaseTicketReqDTO requestParam) {
-        // 车次站点是否还有余票。如果用户提交多个乘车人非同一座位类型，拆分验证
+        // 展示余票只用于页面和令牌桶容量；这里仅在缓存缺失时预热。
+        // 快照为零不能据此拒绝购票，锁内位图才是座位可售性的最终裁决。
         String keySuffix = StrUtil.join("_", requestParam.getTrainId(), requestParam.getDeparture(), requestParam.getArrival());
         StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
-        List<PurchaseTicketPassengerDetailDTO> passengerDetails = requestParam.getPassengers();
-        Map<Integer, List<PurchaseTicketPassengerDetailDTO>> seatTypeMap = passengerDetails.stream()
-                .collect(Collectors.groupingBy(PurchaseTicketPassengerDetailDTO::getSeatType));
-        seatTypeMap.forEach((seatType, passengerSeatDetails) -> {
+        requestParam.getPassengers().stream().map(each -> each.getSeatType()).distinct().forEach(seatType -> {
             Object stockObj = stringRedisTemplate.opsForHash().get(TRAIN_STATION_REMAINING_TICKET + keySuffix, String.valueOf(seatType));
-            int stock = Optional.ofNullable(stockObj).map(each -> Integer.parseInt(each.toString())).orElseGet(() -> {
-                Map<String, String> seatMarginMap = seatMarginCacheLoader.load(String.valueOf(requestParam.getTrainId()), String.valueOf(seatType), requestParam.getDeparture(), requestParam.getArrival());
-                return Optional.ofNullable(seatMarginMap.get(String.valueOf(seatType))).map(Integer::parseInt).orElse(0);
-            });
-            if (stock >= passengerSeatDetails.size()) {
-                return;
+            if (stockObj == null) {
+                seatMarginCacheLoader.load(requestParam.getTrainId(), String.valueOf(seatType),
+                        requestParam.getDeparture(), requestParam.getArrival());
             }
-            // 零点即时广播：售罄即刻置位标志，正在排队的等待线程最迟 200ms 内退出，无需等待刷新器周期或超时上限
-            ticketStockDisplayRefresher.markSoldOut(String.valueOf(requestParam.getTrainId()),
-                    requestParam.getDeparture(), requestParam.getArrival(), seatTypeMap.keySet());
-            throw new ClientException("车票已售完，您可提交候补订单或选择其他车次");
         });
     }
 

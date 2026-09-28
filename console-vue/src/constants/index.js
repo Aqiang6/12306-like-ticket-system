@@ -13,8 +13,7 @@ export const DISCOUNTS_TYPE = [
 export const TRAIN_TAG = [
   { label: '复', value: '0', color: '#f29c58' },
   { label: '智', value: '1', color: '#7db08d' },
-  { label: '静', value: '2', color: '#64a0f6' },
-  { label: '铺', value: '3', color: '#5d9bf6' }
+  { label: '静', value: '2', color: '#64a0f6' }
 ]
 
 export const TICKET_STATUS_LIST = [
@@ -42,19 +41,7 @@ export const ID_CARD_TYPE = [
 export const SEAT_CLASS_TYPE_LIST = [
   { label: '商务座', code: 0 },
   { label: '一等座', code: 1 },
-  { label: '二等座', code: 2 },
-  { label: '二等包座', code: 3 },
-  { label: '一等卧', code: 4 },
-  { label: '二等卧', code: 5 },
-  { label: '软卧', code: 6 },
-  { label: '硬卧', code: 7 },
-  { label: '硬座', code: 8 },
-  { label: '高级软卧', code: 9 },
-  { label: '动卧', code: 10 },
-  { label: '软座', code: 11 },
-  { label: '特等座', code: 12 },
-  { label: '无座', code: 13 },
-  { label: '其他', code: 14 }
+  { label: '二等座', code: 2 }
 ]
 
 export const TRAIN_BRAND_LIST = [

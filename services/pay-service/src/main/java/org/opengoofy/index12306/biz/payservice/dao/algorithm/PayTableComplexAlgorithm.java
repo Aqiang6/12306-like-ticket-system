@@ -44,6 +44,10 @@ public class PayTableComplexAlgorithm implements ComplexKeysShardingAlgorithm {
     @Override
     public Collection<String> doSharding(Collection availableTargetNames, ComplexKeysShardingValue shardingValue) {
         Map<String, Collection<Comparable<?>>> columnNameAndShardingValuesMap = shardingValue.getColumnNameAndShardingValuesMap();
+        // 发件箱扫描没有分片键，需要查询全部分片。
+        if (columnNameAndShardingValuesMap.isEmpty()) {
+            return availableTargetNames;
+        }
         Collection<String> result = new LinkedHashSet<>(availableTargetNames.size());
         if (CollUtil.isNotEmpty(columnNameAndShardingValuesMap)) {
             String userId = "order_sn";
