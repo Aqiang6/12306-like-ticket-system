@@ -27,7 +27,7 @@
       </ThreadGroup>
       <hashTree>
         <CSVDataSet guiclass="TestBeanGUI" testclass="CSVDataSet" testname="loadtest_users" enabled="true">
-          <stringProp name="filename">D:\12306-main\test-run\loadtest_users.csv</stringProp>
+          <stringProp name="filename">loadtest_users.csv</stringProp>
           <stringProp name="fileEncoding">UTF-8</stringProp>
           <stringProp name="variableNames">loaduser,loaduid,loadtoken,loadpid,loadport,loaddeparture,loadarrival</stringProp>
           <boolProp name="ignoreFirstLine">false</boolProp>

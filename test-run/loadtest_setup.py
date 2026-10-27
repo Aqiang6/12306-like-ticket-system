@@ -22,7 +22,7 @@ if sys.platform == 'win32':
 BASE = 'http://localhost:9001'
 TICKET_BASE = 'http://localhost:9002'
 MYSQL = r'D:\mysql-9.2.0-winx64\bin\mysql.exe'
-RUN_DIR = Path(r'D:\12306-main\test-run')
+RUN_DIR = Path(__file__).resolve().parent
 USERS_CSV = RUN_DIR / 'loadtest_users.csv'
 N_USERS = 10000
 

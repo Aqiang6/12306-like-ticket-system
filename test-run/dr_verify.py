@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 MYSQL = r'D:\mysql-9.2.0-winx64\bin\mysql.exe'
-RUN = Path(r'D:\12306-main\test-run')
+RUN = Path(__file__).resolve().parent
 USERS_CSV = RUN / 'loadtest_users.csv'
 
 

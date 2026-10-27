@@ -1,4 +1,4 @@
-# 12306—高并发铁路购票平台
+# 12306-like-ticket-system — 高并发铁路购票平台
 
 对标 12306 的全链路铁路购票系统，基于开源项目 [nageoffer/12306](https://github.com/nageoffer/12306) 二次开发。覆盖用户注册登录、余票查询、在线选座购票、支付、订单管理、改签、退票完整业务闭环，重点围绕**购票链路的分层并发设计**与**库存模型**演进。
 
@@ -27,68 +27,6 @@
 ├── test-run/                    # 压测与多实例联调运行资产（JMX、ShardingSphere 配置、准备脚本）
 ├── start.py / start.bat         # Windows 一键启动编排
 └── test-apis.py                 # 核心接口冒烟脚本
-```
-
-## 快速启动
-
-### 环境要求
-
-- JDK 17+、Maven 3.8+、Node.js 16+、Python 3.8+
-- 本机安装 MySQL、Redis、RocketMQ（4.x），并在 `start.py` 顶部"配置区"核对路径与端口：
-  - MySQL `3306`、Redis `6379`、RocketMQ NameServer `9876` / Broker `10911`
-  - JDK 17 运行 RocketMQ 4.9.5 需追加模块开放参数（见 `bin/broker_j17.bat` 示例）：
-    `--add-opens java.base/java.nio=ALL-UNNAMED --add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED --add-exports java.base/jdk.internal.ref=ALL-UNNAMED`
-
-### 一键启动（推荐）
-
-```bash
-# Windows 双击或命令行执行
-start.bat
-```
-
-`start.py` 会按序完成：
-
-1. 启动 MySQL / Redis / RocketMQ（已运行则跳过）
-2. 构建后端 jar（已构建则跳过）、安装前端依赖（已安装则跳过）
-3. 启动聚合服务 `9005` → 网关 `9000` → 前端 `8080`，各自探活等待就绪
-4. 自动打开浏览器 `http://localhost:8080`
-
-> 注意：聚合服务 jar 需要重新构建才会包含最新购票实现（`mvn -pl services/aggregation-service -am package`）。
-
-### 首次启动前：初始化数据库
-
-执行 `resources/db/` 下 4 个脚本，创建 4 个业务库：
-
-- `12306-springcloud-user.sql` → `12306_user`
-- `12306-springcloud-ticket.sql` → `12306_ticket`（含新库存模型：`t_seat` 注册表 + `t_ticket` 售卖区间账本）
-- `12306-springcloud-order.sql` → `12306_order`
-- `12306-springcloud-pay.sql` → `12306_pay`
-
-演示账号：`admin / admin123456`。
-
-### 手动启动（两种模式）
-
-```bash
-# 模式一：聚合（四业务服务单进程，无需 Nacos，本地演示）
-mvn -pl services/aggregation-service,services/gateway-service -am package -DskipTests
-java -jar services/aggregation-service/target/index12306-aggregation-service.jar
-java -jar services/gateway-service/target/index12306-gateway-service.jar
-
-# 模式二：微服务（Nacos 服务发现 + 网关 lb:// 负载均衡，支持购票服务多实例水平扩展）
-# 先启动 Nacos（standalone）与 RocketMQ，再依次拉起业务服务（例：购票服务双实例 9002/9012）
-java -jar services/user-service/target/index12306-user-service.jar
-java -jar services/order-service/target/index12306-order-service.jar
-java -jar services/ticket-service/target/index12306-ticket-service.jar          # 9002
-java -jar services/ticket-service/target/index12306-ticket-service.jar --server.port=9012
-java -jar services/gateway-service/target/index12306-gateway-service.jar --spring.profiles.active=dev
-```
-
-多实例联调/压测时统一数据源：`test-run/*.yaml` 提供 4 个服务的 ShardingSphere 配置（全部指向单库 `12306`），启动时以命令行覆盖数据源即可，例如：
-
-```bash
-java -jar services/ticket-service/target/index12306-ticket-service-0.0.1-SNAPSHOT.jar \
-  --spring.datasource.driver-class-name=org.apache.shardingsphere.driver.ShardingSphereDriver \
-  "--spring.datasource.url=jdbc:shardingsphere:absolutepath:D:/12306-main/test-run/ticket-shardingsphere.yaml"
 ```
 
 ## 库存模型（三层职责）
@@ -255,6 +193,73 @@ python test-run/run_scenarios.py seg,full       # 任意子集
 
 单场景步骤等价命令：`loadtest_setup.py routes <scenario>`（seg/half/full/random/even）→ `warmup` → JMeter `loadtest_segments.jmx` → `verify <scenario>` → `close` → `verify <scenario> post`。成交事实以 `t_ticket` 账本 + `t_order` 为准，`verify` 自动核对三口径并断言理论容量上限。
 
+## 声明
+
+- 本项目基于 [nageoffer/12306](https://github.com/nageoffer/12306) 学习二次开发，原版架构解析见其官方文档
+- 仅用于学习交流，请勿用于生产环境
+
+## 快速启动
+
+### 环境要求
+
+- JDK 17+、Maven 3.8+、Node.js 16+、Python 3.8+
+- 本机安装 MySQL、Redis、RocketMQ（4.x），并在 `start.py` 顶部"配置区"核对路径与端口：
+  - MySQL `3306`、Redis `6379`、RocketMQ NameServer `9876` / Broker `10911`
+  - JDK 17 运行 RocketMQ 4.9.5 需追加模块开放参数（见 `bin/broker_j17.bat` 示例）：
+    `--add-opens java.base/java.nio=ALL-UNNAMED --add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED --add-exports java.base/jdk.internal.ref=ALL-UNNAMED`
+
+### 一键启动（推荐）
+
+```bash
+# Windows 双击或命令行执行
+start.bat
+```
+
+`start.py` 会按序完成：
+
+1. 启动 MySQL / Redis / RocketMQ（已运行则跳过）
+2. 构建后端 jar（已构建则跳过）、安装前端依赖（已安装则跳过）
+3. 启动聚合服务 `9005` → 网关 `9000` → 前端 `8080`，各自探活等待就绪
+4. 自动打开浏览器 `http://localhost:8080`
+
+> 注意：聚合服务 jar 需要重新构建才会包含最新购票实现（`mvn -pl services/aggregation-service -am package`）。
+
+### 首次启动前：初始化数据库
+
+执行 `resources/db/` 下 4 个脚本，创建 4 个业务库：
+
+- `12306-springcloud-user.sql` → `12306_user`
+- `12306-springcloud-ticket.sql` → `12306_ticket`（含新库存模型：`t_seat` 注册表 + `t_ticket` 售卖区间账本）
+- `12306-springcloud-order.sql` → `12306_order`
+- `12306-springcloud-pay.sql` → `12306_pay`
+
+演示账号：`admin / admin123456`。
+
+### 手动启动（两种模式）
+
+```bash
+# 模式一：聚合（四业务服务单进程，无需 Nacos，本地演示）
+mvn -pl services/aggregation-service,services/gateway-service -am package -DskipTests
+java -jar services/aggregation-service/target/index12306-aggregation-service.jar
+java -jar services/gateway-service/target/index12306-gateway-service.jar
+
+# 模式二：微服务（Nacos 服务发现 + 网关 lb:// 负载均衡，支持购票服务多实例水平扩展）
+# 先启动 Nacos（standalone）与 RocketMQ，再依次拉起业务服务（例：购票服务双实例 9002/9012）
+java -jar services/user-service/target/index12306-user-service.jar
+java -jar services/order-service/target/index12306-order-service.jar
+java -jar services/ticket-service/target/index12306-ticket-service.jar          # 9002
+java -jar services/ticket-service/target/index12306-ticket-service.jar --server.port=9012
+java -jar services/gateway-service/target/index12306-gateway-service.jar --spring.profiles.active=dev
+```
+
+多实例联调/压测时统一数据源：`test-run/*.yaml` 提供 4 个服务的 ShardingSphere 配置（全部指向单库 `12306`），启动时以命令行覆盖数据源即可，例如：
+
+```bash
+java -jar services/ticket-service/target/index12306-ticket-service-0.0.1-SNAPSHOT.jar \
+  --spring.datasource.driver-class-name=org.apache.shardingsphere.driver.ShardingSphereDriver \
+  "--spring.datasource.url=jdbc:shardingsphere:absolutepath:D:/12306-like-ticket-system/test-run/ticket-shardingsphere.yaml"
+```
+
 ## 测试与联调
 
 已有数据库升级时，先在每个支付物理库执行 `resources/db/migration/20260928-pay-result-outbox.sql`，再在票务库执行 `20260928-ticket-seat-interval-index.sql` 和 `20260928-remove-unsupported-ticket-catalog.sql`；新建库可直接使用更新后的建表和种子脚本。
@@ -286,8 +291,3 @@ python test-run/dr_verify.py C   # 300 并发购票中 kill -9 双实例之一�
 ```
 
 > 运行产物（HTML 报告、JTL、用户 token CSV、日志、本机启动脚本）已在 `.gitignore` 中排除；JMeter 计划、准备脚本与 ShardingSphere 运行配置纳入版本管理。
-
-## 声明
-
-- 本项目基于 [nageoffer/12306](https://github.com/nageoffer/12306) 学习二次开发，原版架构解析见其官方文档
-- 仅用于学习交流，请勿用于生产环境
